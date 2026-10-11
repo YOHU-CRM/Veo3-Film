@@ -17,18 +17,35 @@ export const MIN_SCENE_SECONDS = 0.5;
 export const MIN_CUE_SECONDS = 0.8;
 /** Cảnh ảnh: số giây mặc định / tối thiểu (đủ cho vào-hiện, lóe sáng, giữ khung cuối) */
 export const DEFAULT_IMAGE_SECONDS = 7;
+/** Tên cũ, giữ lại để máy dựng FFmpeg bản GitHub vẫn chạy */
+export const IMAGE_DEFAULT_SECONDS = DEFAULT_IMAGE_SECONDS;
 export const MIN_IMAGE_SECONDS = 2.5;
 /** Cạnh dài tối đa khi lấy kích thước ảnh làm khung phim (tránh ra video quá lớn) */
 const MAX_IMAGE_LONG_SIDE = 1920;
 
-/** Thời lượng thô (giây) của một cảnh – DÙNG CHUNG cho timeline và ước tính. */
-export function sceneRawDuration(s: Pick<SceneSpec, 'kind' | 'videoDuration' | 'voiceDuration' | 'imageDuration'>): number {
+export type DurationSource = 'user' | 'voice' | 'image' | 'clip';
+
+type DurationInput = Pick<SceneSpec, 'kind' | 'videoDuration' | 'voiceDuration' | 'imageDuration' | 'userDuration'>;
+
+/**
+ * Thời lượng thô (giây) của một cảnh – DÙNG CHUNG cho timeline, ước tính và hiển thị.
+ * Thứ tự ưu tiên:  1) người dùng tự đặt  >  2) thời lượng voice  >  3) số giây mặc định của ảnh / độ dài clip gốc.
+ * - Đặt ngắn hơn voice: voice bị cắt cho vừa cảnh. Đặt dài hơn clip: clip được lặp lại cho đủ.
+ */
+export function sceneDuration(s: DurationInput): { seconds: number; source: DurationSource } {
+  const user = s.userDuration && s.userDuration > 0 ? s.userDuration : 0;
+  if (user > 0) return { seconds: Math.max(MIN_SCENE_SECONDS, user), source: 'user' };
   const voice = s.voiceDuration && s.voiceDuration > 0 ? s.voiceDuration : 0;
   if (s.kind === 'image') {
-    if (voice > 0) return Math.max(MIN_IMAGE_SECONDS, VOICE_LEAD + voice + VOICE_TAIL);
-    return Math.max(MIN_IMAGE_SECONDS, s.imageDuration || DEFAULT_IMAGE_SECONDS);
+    if (voice > 0) return { seconds: Math.max(MIN_IMAGE_SECONDS, VOICE_LEAD + voice + VOICE_TAIL), source: 'voice' };
+    return { seconds: Math.max(MIN_IMAGE_SECONDS, s.imageDuration || DEFAULT_IMAGE_SECONDS), source: 'image' };
   }
-  return voice > 0 ? VOICE_LEAD + voice + VOICE_TAIL : Math.max(MIN_SCENE_SECONDS, s.videoDuration || MIN_SCENE_SECONDS);
+  if (voice > 0) return { seconds: VOICE_LEAD + voice + VOICE_TAIL, source: 'voice' };
+  return { seconds: Math.max(MIN_SCENE_SECONDS, s.videoDuration || MIN_SCENE_SECONDS), source: 'clip' };
+}
+
+export function sceneRawDuration(s: DurationInput): number {
+  return sceneDuration(s).seconds;
 }
 
 /** Kích thước khung phim khi cảnh đầu là ảnh: giữ tỉ lệ, cạnh dài <= 1920 */
@@ -244,6 +261,7 @@ export function buildTimeline(scenes: SceneSpec[], settings: RenderSettings): Ti
       start: cursorFrames / FPS,
       duration,
       frames,
+      kind: scene.kind === 'image' ? 'image' : 'video',
       loop: scene.kind === 'image' ? false : (scene.videoDuration || 0) + 0.05 < duration,
       voiceOffset: voice > 0 ? VOICE_LEAD : null,
       voiceDuration: voice,

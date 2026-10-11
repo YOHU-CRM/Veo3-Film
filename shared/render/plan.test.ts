@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseSceneNumber, resolveOutputSize, splitSubtitleText, allocateCues,
-  buildTimeline, estimateTotalDuration, FPS, VOICE_LEAD, VOICE_TAIL,
+  buildTimeline, estimateTotalDuration, sceneDuration, FPS, VOICE_LEAD, VOICE_TAIL,
 } from './plan';
 import type { RenderSettings, SceneSpec } from './types';
 
@@ -115,4 +115,43 @@ test('ảnh lớn làm khung gốc: cạnh dài bị giới hạn 1920', () => {
   const tl = buildTimeline([{ id: 'a', kind: 'image', videoDuration: 7, videoWidth: 4000, videoHeight: 3000 }], settings);
   assert.ok(Math.max(tl.width, tl.height) <= 1920);
   assert.ok(Math.abs(tl.width / tl.height - 4 / 3) < 0.01);
+});
+
+
+// ───────── Thứ tự ưu tiên thời lượng: người dùng đặt > giọng đọc > ảnh/clip ─────────
+test('thời lượng: người dùng đặt thắng giọng đọc và clip', () => {
+  const d = sceneDuration({ kind: 'video', videoDuration: 12, voiceDuration: 5, userDuration: 8 });
+  assert.equal(d.source, 'user');
+  assert.equal(d.seconds, 8);
+});
+
+test('thời lượng: không đặt thì theo giọng đọc (có đệm đầu/cuối)', () => {
+  const d = sceneDuration({ kind: 'video', videoDuration: 12, voiceDuration: 5 });
+  assert.equal(d.source, 'voice');
+  assert.ok(Math.abs(d.seconds - (VOICE_LEAD + 5 + VOICE_TAIL)) < 1e-9);
+});
+
+test('thời lượng: không voice thì ảnh theo số giây mặc định, video theo clip gốc', () => {
+  assert.equal(sceneDuration({ kind: 'image', videoDuration: 0, imageDuration: 6 }).source, 'image');
+  assert.equal(sceneDuration({ kind: 'image', videoDuration: 0, imageDuration: 6 }).seconds, 6);
+  const v = sceneDuration({ kind: 'video', videoDuration: 9.5 });
+  assert.equal(v.source, 'clip');
+  assert.equal(v.seconds, 9.5);
+});
+
+test('thời lượng: đặt 0 hoặc âm thì bỏ qua, quay về tự động', () => {
+  assert.equal(sceneDuration({ kind: 'video', videoDuration: 4, userDuration: 0 }).source, 'clip');
+  assert.equal(sceneDuration({ kind: 'video', videoDuration: 4, userDuration: -3 }).source, 'clip');
+});
+
+test('timeline: cảnh đặt thời lượng ngắn hơn voice thì cảnh đúng bằng số đặt, clip ngắn hơn thì lặp', () => {
+  const specs: SceneSpec[] = [
+    { id: 'a', kind: 'video', videoDuration: 3, videoWidth: 1920, videoHeight: 1080, voiceDuration: 9, userDuration: 5 },
+    { id: 'b', kind: 'video', videoDuration: 3, videoWidth: 1920, videoHeight: 1080, userDuration: 7 },
+  ];
+  const tl = buildTimeline(specs, settings);
+  assert.ok(Math.abs(tl.scenes[0].duration - 5) < 1 / FPS + 1e-9);
+  assert.ok(Math.abs(tl.scenes[1].duration - 7) < 1 / FPS + 1e-9);
+  assert.equal(tl.scenes[1].loop, true);
+  assert.ok(Math.abs(estimateTotalDuration(specs) - tl.totalDuration) < 1e-6);
 });

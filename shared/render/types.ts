@@ -6,6 +6,11 @@
 import type { MotionStyle } from '../imageMotion/plan';
 export type { MotionStyle };
 
+export type SceneKind = 'video' | 'image';
+/** Nhạc nền tự tạo bằng FFmpeg (miễn phí, không dính bản quyền) */
+export type MusicMood = 'calm' | 'warm' | 'cinematic' | 'upbeat';
+export const MUSIC_MOODS: MusicMood[] = ['calm', 'warm', 'cinematic', 'upbeat'];
+
 export type AspectRatioOpt = 'original' | '16:9' | '9:16' | '1:1';
 export type FitMode = 'blur' | 'cover' | 'contain';
 export type QualityOpt = 'original' | '720p' | '1080p' | '4k';
@@ -24,6 +29,8 @@ export interface RenderSettings {
 
 /** Thông tin 1 cảnh đã đọc xong (kích thước, thời lượng) – dùng để lập timeline. */
 export interface SceneSpec {
+  /** Thời lượng người dùng tự đặt (giây). ƯU TIÊN SỐ 1, cao hơn thời lượng voice và độ dài clip */
+  userDuration?: number;
   id: string;
   /** 'video' (mặc định) hoặc 'image' (ảnh tĩnh -> chuyển động an toàn cho chữ) */
   kind?: 'video' | 'image';
@@ -45,6 +52,8 @@ export interface SubtitleCue {
 
 export interface TimelineScene {
   id: string;
+  /** 'image' hoặc 'video' */
+  kind: SceneKind;
   index: number;
   /** Giây, tính từ đầu PHIM */
   start: number;
@@ -94,6 +103,8 @@ export interface RenderManifest {
     /** cảnh ảnh: file gửi kèm với tên field i_<id> */
     hasImage?: boolean;
     imageDuration?: number;
+    /** Thời lượng người dùng đặt (giây): ưu tiên số 1 */
+    userDuration?: number;
     motionStyle?: MotionStyle;
     imageName?: string;
     hasVoice: boolean;
@@ -104,4 +115,6 @@ export interface RenderManifest {
   }>;
   hasBgm: boolean;
   bgmName?: string;
+  /** Có giá trị và không upload nhạc -> máy dựng tự tạo nhạc nền theo phong cách này */
+  generatedMusic?: MusicMood | null;
 }
