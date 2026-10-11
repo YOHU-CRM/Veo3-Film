@@ -11,18 +11,21 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import { buildTimeline } from '../../shared/render/plan';
-import type { RenderManifest, SceneSpec, Timeline, TimelineScene } from '../../shared/render/types';
+import { buildTimeline, IMAGE_DEFAULT_SECONDS } from '../../shared/render/plan';
+import type { RenderManifest, SceneKind, SceneSpec, Timeline, TimelineScene } from '../../shared/render/types';
 import { buildAss } from './ass';
 import { FFMPEG } from './binaries';
+import { getMusicFile } from './music';
 import { probeMedia } from './probe';
-import { imagesSupported, probeImage, renderImageSegment } from './imageScene';
 import { runFfmpeg, UserError } from './proc';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FONTS_DIR = path.resolve(HERE, '../fonts');
+/** Bộ nhớ đệm nhạc tự tạo (nằm ngoài thư mục job nên không bị dọn cùng job) */
+const CACHE_DIR = process.env.RENDER_CACHE_DIR || path.join(os.tmpdir(), 'yohu-render-cache');
 
 export interface RenderContext {
   /** Thư mục làm việc của job */
@@ -51,11 +54,9 @@ const rel = (dir: string, file: string) => path.relative(dir, file).split(path.s
 
 interface UsableScene {
   id: string;
+  kind: SceneKind;
   label: string;
-  kind: 'video' | 'image';
-  /** cảnh video: file video; cảnh ảnh: file ảnh */
   videoPath: string;
-  motionStyle?: import('../../shared/imageMotion').MotionStyle;
   voicePath?: string;
   spec: SceneSpec;
 }
@@ -71,35 +72,20 @@ async function collectUsableScenes(ctx: RenderContext): Promise<UsableScene[]> {
     const label = `Cảnh ${i + 1}`;
     ctx.report(1 + Math.round((i / Math.max(1, total)) * 6), `Đang kiểm tra file (${i + 1}/${total})...`);
 
-    const isImage = sc.kind === 'image';
-    const videoPath = ctx.files.get(isImage ? `i_${sc.id}` : `v_${sc.id}`);
-    let mediaW = 0, mediaH = 0, mediaDuration = 0;
-    if (isImage) {
-      if (!sc.hasImage || !videoPath) {
-        if (sc.hasVoice) ctx.warn(`${label}: có voice nhưng chưa có ảnh nên đã bỏ qua cảnh này.`);
-        continue;
-      }
-      if (!imagesSupported()) {
-        ctx.warn(`${label}: máy dựng chưa cài thư viện xử lý ảnh nên đã bỏ qua cảnh ảnh (chạy lại "npm install" trong render-server).`);
-        continue;
-      }
-      const iInfo = await probeImage(videoPath);
-      if (!iInfo) {
-        ctx.warn(`${label}: file ảnh "${sc.imageName ?? ''}" bị hỏng hoặc không đọc được nên đã bỏ qua.`);
-        continue;
-      }
-      mediaW = iInfo.width; mediaH = iInfo.height; mediaDuration = sc.imageDuration ?? 0;
-    } else {
-      if (!sc.hasVideo || !videoPath) {
-        if (sc.hasVoice) ctx.warn(`${label}: có voice nhưng chưa có video nên đã bỏ qua cảnh này.`);
-        continue;
-      }
-      const vInfo = await probeMedia(videoPath, ctx.signal);
-      if (!vInfo || !vInfo.hasVideo || vInfo.duration < 0.1) {
-        ctx.warn(`${label}: file video "${sc.videoName ?? ''}" bị hỏng hoặc không đọc được nên đã bỏ qua.`);
-        continue;
-      }
-      mediaW = vInfo.width; mediaH = vInfo.height; mediaDuration = vInfo.duration;
+    const videoPath = ctx.files.get(`v_${sc.id}`);
+    if (!sc.hasVideo || !videoPath) {
+      if (sc.hasVoice) ctx.warn(`${label}: có voice nhưng chưa có video nên đã bỏ qua cảnh này.`);
+      continue;
+    }
+
+    const kind: SceneKind = sc.kind === 'image' ? 'image' : 'video';
+    const vInfo = await probeMedia(videoPath, ctx.signal, kind === 'image');
+    const okMedia = kind === 'image'
+      ? !!vInfo && vInfo.hasVideo && vInfo.width > 0 && vInfo.height > 0
+      : !!vInfo && vInfo.hasVideo && vInfo.duration >= 0.1;
+    if (!vInfo || !okMedia) {
+      ctx.warn(`${label}: file ${kind === 'image' ? 'ảnh' : 'video'} "${sc.videoName ?? ''}" bị hỏng hoặc không đọc được nên đã bỏ qua.`);
+      continue;
     }
 
     let voicePath: string | undefined;
@@ -117,19 +103,18 @@ async function collectUsableScenes(ctx: RenderContext): Promise<UsableScene[]> {
 
     usable.push({
       id: sc.id,
+      kind,
       label,
-      kind: isImage ? 'image' : 'video',
-      motionStyle: sc.motionStyle,
       videoPath,
       voicePath,
       spec: {
         id: sc.id,
-        kind: isImage ? 'image' : 'video',
-        imageDuration: isImage ? sc.imageDuration : undefined,
-        videoDuration: mediaDuration,
-        videoWidth: mediaW,
-        videoHeight: mediaH,
+        kind,
+        videoDuration: kind === 'image' ? IMAGE_DEFAULT_SECONDS : vInfo.duration,
+        videoWidth: vInfo.width,
+        videoHeight: vInfo.height,
         voiceDuration,
+        userDuration: sc.userDuration,
         subtitleText: sc.subtitleText,
       },
     });
@@ -171,6 +156,45 @@ function buildVideoGraph(
   ].join(';');
 }
 
+/**
+ * Cảnh ẢNH: đặt ảnh vừa khung (nền mờ/lấp đầy/viền đen) rồi zoom nhẹ chậm (kiểu "Ken Burns").
+ * Dựng ở độ phân giải gấp đôi rồi mới zoompan để chuyển động mượt, không bị giật pixel.
+ */
+export function buildImageGraph(
+  fit: 'blur' | 'cover' | 'contain',
+  W: number,
+  H: number,
+  frames: number,
+  index: number,
+  fps: number,
+  assFile: string | null,
+): string {
+  const S = W * 2 <= 4096 ? 2 : 1;
+  const CW = W * S;
+  const CH = H * S;
+  let compose: string;
+  if (fit === 'cover') {
+    compose = `[0:v]scale=${CW}:${CH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${CW}:${CH},setsar=1[c]`;
+  } else if (fit === 'contain') {
+    compose = `[0:v]scale=${CW}:${CH}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[c]`;
+  } else {
+    const bw = Math.max(16, Math.round(W / 8));
+    const bh = Math.max(16, Math.round(H / 8));
+    compose = [
+      '[0:v]split=2[a][b]',
+      `[a]scale=${bw}:${bh}:force_original_aspect_ratio=increase,crop=${bw}:${bh},gblur=sigma=4,scale=${CW}:${CH},eq=brightness=-0.12[bg]`,
+      `[b]scale=${CW}:${CH}:force_original_aspect_ratio=decrease:flags=lanczos[fg]`,
+      '[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[c]',
+    ].join(';');
+  }
+  // Luân phiên zoom vào / zoom ra giữa các ảnh cho tự nhiên
+  const zoom = index % 2 === 0
+    ? `1+0.12*on/${frames}`
+    : `1.12-0.12*on/${frames}`;
+  const tail = assFile ? `,ass=${assFile}:fontsdir=fonts` : '';
+  return `${compose};[c]zoompan=z='${zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${W}x${H}:fps=${fps},setsar=1,format=yuv420p${tail}[v]`;
+}
+
 async function renderSegments(
   ctx: RenderContext,
   usable: UsableScene[],
@@ -180,7 +204,6 @@ async function renderSegments(
   const totalFrames = timeline.scenes.reduce((a, s) => a + s.frames, 0);
   const segments: string[] = [];
   let doneFrames = 0;
-  let imageIndex = 0;
 
   for (const scene of timeline.scenes) {
     const src = usable[scene.index];
@@ -197,35 +220,21 @@ async function renderSegments(
       );
     }
 
+    const isImage = src.kind === 'image';
+    const graph = isImage
+      ? buildImageGraph(settings.fitMode, timeline.width, timeline.height, scene.frames, scene.index, timeline.fps, assFile)
+      : buildVideoGraph(
+        settings.fitMode, timeline.width, timeline.height,
+        src.spec.videoWidth, src.spec.videoHeight, assFile,
+      );
+
     ctx.report(
       8 + Math.round((doneFrames / totalFrames) * 62),
       `Đang dựng cảnh ${scene.index + 1}/${timeline.scenes.length}...`,
     );
 
-    if (src.kind === 'image') {
-      await renderImageSegment({
-        imagePath: src.videoPath, outName: segName, cwd: ctx.dir,
-        width: timeline.width, height: timeline.height, frames: scene.frames, fps: timeline.fps,
-        fit: settings.fitMode, style: src.motionStyle ?? 'auto', variant: imageIndex++,
-        assFile, preset: PRESET, crf: CRF, signal: ctx.signal,
-        onSeconds: sec => ctx.report(
-          8 + Math.round(((doneFrames + Math.min(scene.frames, sec * timeline.fps)) / totalFrames) * 62),
-          `Đang dựng cảnh ${scene.index + 1}/${timeline.scenes.length}...`,
-        ),
-      });
-      try { fs.rmSync(src.videoPath, { force: true }); } catch { /* bỏ qua */ }
-      segments.push(segName);
-      doneFrames += scene.frames;
-      continue;
-    }
-
-    const graph = buildVideoGraph(
-      settings.fitMode, timeline.width, timeline.height,
-      src.spec.videoWidth, src.spec.videoHeight, assFile,
-    );
-
     await runFfmpeg(FFMPEG, [
-      '-stream_loop', '-1',
+      ...(isImage ? [] : ['-stream_loop', '-1']),
       '-i', rel(ctx.dir, src.videoPath),
       '-filter_complex', graph,
       '-map', '[v]',
@@ -358,7 +367,16 @@ async function buildAudio(
   }
 
   let bgmIndex: number | null = null;
-  const bgmPath = settings.enableBgm ? ctx.files.get('bgm') : undefined;
+  let bgmPath = settings.enableBgm ? ctx.files.get('bgm') : undefined;
+  if (!bgmPath && settings.enableBgm && ctx.manifest.generatedMusic) {
+    ctx.report(74, 'Đang tạo nhạc nền...');
+    try {
+      bgmPath = await getMusicFile(ctx.manifest.generatedMusic, CACHE_DIR, ctx.signal);
+    } catch (e: any) {
+      if (e?.message === 'ABORTED') throw e;
+      ctx.warn('Không tạo được nhạc nền tự động nên phim được dựng không có nhạc nền.');
+    }
+  }
   if (bgmPath) {
     const info = await probeMedia(bgmPath, ctx.signal);
     if (info?.hasAudio) {
