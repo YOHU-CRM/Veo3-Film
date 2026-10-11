@@ -96,6 +96,7 @@ export async function renderRemote(req: RenderRequest, cb: RenderCallbacks): Pro
   const manifest: RenderManifest = {
     settings: req.settings,
     hasBgm: !!req.bgm && req.settings.enableBgm,
+    generatedMusic: !req.bgm && req.settings.enableBgm ? (req.generatedMusic ?? null) : null,
     bgmName: req.bgm?.name,
     scenes: scenes.map(s => ({
       id: s.id,
@@ -103,6 +104,7 @@ export async function renderRemote(req: RenderRequest, cb: RenderCallbacks): Pro
       hasVideo: s.kind !== 'image' && !!s.videoUrl,
       hasImage: s.kind === 'image' && !!s.imageUrl,
       imageDuration: s.kind === 'image' ? s.imageDuration : undefined,
+      userDuration: s.userDuration,
       motionStyle: s.kind === 'image' ? s.motionStyle : undefined,
       imageName: s.kind === 'image' ? s.videoName : undefined,
       hasVoice: !!s.voiceUrl || !!s.voiceFile,

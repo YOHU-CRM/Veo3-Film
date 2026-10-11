@@ -3,13 +3,15 @@
  * HÀM THUẦN (không phụ thuộc trình duyệt) nên test được bằng Node.
  */
 
-export type FileKind = 'video' | 'image' | 'audio' | 'pdf' | 'zip' | 'text' | 'ignore' | 'unknown';
+export type FileKind = 'video' | 'image' | 'audio' | 'pdf' | 'zip' | 'text' | 'office' | 'legacy' | 'ignore' | 'unknown';
 
 const EXT: Record<string, FileKind> = {
   mp4: 'video', mov: 'video', webm: 'video', mkv: 'video', avi: 'video', m4v: 'video',
   jpg: 'image', jpeg: 'image', png: 'image', webp: 'image', bmp: 'image',
   mp3: 'audio', wav: 'audio', m4a: 'audio', aac: 'audio', ogg: 'audio', flac: 'audio', opus: 'audio',
   pdf: 'pdf', zip: 'zip',
+  pptx: 'office', docx: 'office', xlsx: 'office',
+  ppt: 'legacy', doc: 'legacy', xls: 'legacy', odt: 'legacy', odp: 'legacy', ods: 'legacy', rtf: 'legacy',
   txt: 'text', md: 'text', srt: 'text',
 };
 

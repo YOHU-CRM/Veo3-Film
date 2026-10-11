@@ -1,6 +1,6 @@
-import type { RenderSettings, MotionStyle } from '../../shared/render/types';
+import type { MusicMood, RenderSettings, MotionStyle } from '../../shared/render/types';
 
-export type { RenderSettings, MotionStyle };
+export type { MusicMood, RenderSettings, MotionStyle };
 
 /** Một cảnh như giao diện đang giữ (clip + voice + chữ phụ đề) */
 export interface EngineScene {
@@ -10,6 +10,8 @@ export interface EngineScene {
   imageFile?: File;
   imageUrl?: string;
   imageDuration?: number;
+  /** Thời lượng người dùng đặt (giây): ưu tiên số 1 */
+  userDuration?: number;
   motionStyle?: MotionStyle;
   videoFile?: File;
   videoUrl: string;
@@ -28,6 +30,8 @@ export interface RenderRequest {
   scenes: EngineScene[];
   settings: RenderSettings;
   bgm?: { url: string; name: string };
+  /** Nhạc nền tự tạo bằng máy dựng (chỉ dùng khi không có bgm tải lên) */
+  generatedMusic?: MusicMood | null;
 }
 
 export interface RenderCallbacks {

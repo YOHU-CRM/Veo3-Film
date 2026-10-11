@@ -38,8 +38,8 @@ export const UniversalDropZone: React.FC<Props> = ({ isVN, busy, message, onFile
           </div>
           <div className="text-[11px] text-slate-400 font-medium max-w-xl">
             {isVN
-              ? 'Video, ảnh, voice, nhạc, kịch bản (PDF / TXT) hoặc một file ZIP. Hệ thống tự nhận diện và sắp xếp theo số cảnh trong tên file.'
-              : 'Videos, images, voice, music, script (PDF / TXT) or a ZIP. Everything is detected and ordered automatically.'}
+              ? 'Video, ảnh, voice, nhạc, PDF (mỗi trang = 1 cảnh), PowerPoint / Word / Excel (đọc chữ làm kịch bản), TXT hoặc ZIP. Tự nhận diện và sắp xếp theo số trong tên file.'
+              : 'Videos, images, voice, music, PDF (one page = one scene), PowerPoint / Word / Excel (text as script), TXT or ZIP.'}
           </div>
         </div>
         <input
@@ -47,7 +47,7 @@ export const UniversalDropZone: React.FC<Props> = ({ isVN, busy, message, onFile
           type="file"
           multiple
           hidden
-          accept="video/*,image/*,audio/*,.pdf,.zip,.txt,.md,.srt"
+          accept="video/*,image/*,audio/*,.pdf,.pptx,.docx,.xlsx,.zip,.txt,.md,.srt"
           onChange={e => { if (e.target.files?.length) onFiles(Array.from(e.target.files)); e.target.value = ''; }}
         />
       </div>

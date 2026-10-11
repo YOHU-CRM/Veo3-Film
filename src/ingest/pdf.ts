@@ -6,6 +6,8 @@
 export interface PdfTextResult {
   text: string;
   pages: number;
+  /** Chữ của từng trang (đúng thứ tự trang) */
+  pageTexts: string[];
   /** true: gần như không có chữ -> nhiều khả năng là PDF scan */
   scanned: boolean;
 }
@@ -49,5 +51,5 @@ export async function extractPdfText(file: Blob, opts: { workerSrc?: string } = 
 
   const text = pageTexts.join('\n\n').trim();
   const perPage = text.replace(/\s/g, '').length / Math.max(1, doc.numPages);
-  return { text, pages: doc.numPages, scanned: perPage < 20 };
+  return { text, pages: doc.numPages, pageTexts, scanned: perPage < 20 };
 }

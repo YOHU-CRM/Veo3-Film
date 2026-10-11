@@ -5,6 +5,7 @@
  */
 import { classifyFile } from './classify';
 import { expandZip } from './zip';
+import { extractOfficeText, type OfficeExt } from './office';
 
 export interface IngestResult {
   videos: File[];
@@ -12,6 +13,8 @@ export interface IngestResult {
   audios: File[];
   /** Mỗi phần tử = nội dung chữ của 1 file kịch bản (PDF/TXT/SRT) */
   scripts: Array<{ name: string; text: string }>;
+  /** PDF giữ nguyên để giao diện quyết định: dùng làm slide (mỗi trang 1 cảnh) hay làm kịch bản chữ */
+  pdfs: Array<{ file: File; text: string; pageTexts: string[]; scanned: boolean }>;
   warnings: string[];
   /** Số file ZIP đã mở */
   zipsOpened: number;
@@ -19,11 +22,13 @@ export interface IngestResult {
 
 export interface IngestOptions {
   /** Hàm đọc chữ PDF (tách riêng để trình duyệt tự cấp worker của pdf.js) */
-  readPdf?: (file: File) => Promise<{ text: string; scanned: boolean }>;
+  readPdf?: (file: File) => Promise<{ text: string; scanned: boolean; pageTexts?: string[] }>;
+  /** true: không tự biến PDF thành kịch bản mà trả về res.pdfs để giao diện quyết định */
+  collectPdfs?: boolean;
 }
 
 export async function ingestFiles(input: File[], opts: IngestOptions = {}): Promise<IngestResult> {
-  const res: IngestResult = { videos: [], images: [], audios: [], scripts: [], warnings: [], zipsOpened: 0 };
+  const res: IngestResult = { videos: [], images: [], audios: [], scripts: [], pdfs: [], warnings: [], zipsOpened: 0 };
 
   const queue: File[] = [];
   for (const f of input) {
@@ -51,7 +56,9 @@ export async function ingestFiles(input: File[], opts: IngestOptions = {}): Prom
         if (!opts.readPdf) { res.warnings.push(`Chưa đọc được PDF "${f.name}" trong môi trường này.`); break; }
         try {
           const r = await opts.readPdf(f);
-          if (r.scanned || !r.text) {
+          if (opts.collectPdfs) {
+            res.pdfs.push({ file: f, text: r.text || '', pageTexts: r.pageTexts || [], scanned: !!r.scanned || !r.text });
+          } else if (r.scanned || !r.text) {
             res.warnings.push(`PDF "${f.name}" là dạng ảnh scan (không có chữ để đọc). Hãy dán kịch bản vào hoặc dùng PDF có chữ.`);
           } else {
             res.scripts.push({ name: f.name, text: r.text });
@@ -61,6 +68,24 @@ export async function ingestFiles(input: File[], opts: IngestOptions = {}): Prom
         }
         break;
       }
+      case 'office': {
+        const ext = (f.name.match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase() as OfficeExt;
+        try {
+          const r = await extractOfficeText(f, ext);
+          if (r.text) {
+            res.scripts.push({ name: f.name, text: r.text });
+            res.warnings.push(`"${f.name}": đã đọc CHỮ trong file để làm kịch bản/phụ đề. Muốn có HÌNH của slide/trang thì xuất file ra PDF hoặc ảnh (PNG/JPG) rồi thả vào.`);
+          } else {
+            res.warnings.push(`"${f.name}" không có chữ để đọc. Hãy xuất ra PDF hoặc ảnh rồi thả vào.`);
+          }
+        } catch (e: any) {
+          res.warnings.push(`Không đọc được "${f.name}": ${e?.message || 'file hỏng'}.`);
+        }
+        break;
+      }
+      case 'legacy':
+        res.warnings.push(`"${f.name}" là định dạng cũ (.ppt/.doc/.xls...) nên chưa đọc được. Hãy lưu lại thành .pptx/.docx/.xlsx hoặc xuất ra PDF.`);
+        break;
       case 'ignore': break;
       default: res.warnings.push(`Không nhận ra loại file: ${f.name}`);
     }

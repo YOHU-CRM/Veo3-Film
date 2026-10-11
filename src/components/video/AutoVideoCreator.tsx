@@ -7,17 +7,27 @@ import {
 } from 'lucide-react';
 import { generateGeminiText, generateGeminiVoice, VoiceRegion } from '../../services/gemini';
 import { UserProfile } from '../../types';
-import { parseSceneNumber, estimateTotalDuration, sceneRawDuration, DEFAULT_IMAGE_SECONDS } from '../../../shared/render/plan';
-import type { MotionStyle } from '../../../shared/render/types';
+import { parseSceneNumber, estimateTotalDuration, sceneDuration, DEFAULT_IMAGE_SECONDS, VOICE_LEAD, VOICE_TAIL } from '../../../shared/render/plan';
+import { MUSIC_MOODS, type MusicMood, type MotionStyle } from '../../../shared/render/types';
+import { UniversalDropZone } from './UniversalDropZone';
+import { classifyAudioBatch, ingestFiles, splitScriptToScenes } from '../../ingest';
+import { readPdfInBrowser, renderPdfPages } from '../../ingest/pdfBrowser';
+import { robustAudioDuration, splitVoiceFile } from '../../utils/audioTools';
 import { describeImageMotion, releasePreparedImage } from '../../engine/imageCache';
 import {
   detectEngine, renderMovie, RenderCancelled,
   type EngineKind, type RenderResult,
 } from '../../engine';
 
-/** Thời lượng hiển thị của một cảnh ảnh (theo voice nếu có, không thì theo số giây đã đặt) */
-const imageSceneDuration = (s: { imageDuration?: number; voiceDuration?: number; voiceUrl?: string; videoDuration: number }) =>
-  sceneRawDuration({ kind: 'image', videoDuration: s.videoDuration, imageDuration: s.imageDuration, voiceDuration: s.voiceUrl ? s.voiceDuration : undefined });
+/** Thời lượng + nguồn của MỘT cảnh (ảnh hoặc video). Ưu tiên: bạn tự đặt > giọng đọc > mặc định/clip gốc */
+const sceneInfoOf = (s: { kind?: 'video' | 'image'; imageDuration?: number; voiceDuration?: number; voiceUrl?: string; videoDuration: number; userDuration?: number }) =>
+  sceneDuration({
+    kind: s.kind === 'image' ? 'image' : 'video',
+    videoDuration: s.videoDuration,
+    imageDuration: s.imageDuration,
+    voiceDuration: s.voiceUrl ? s.voiceDuration : undefined,
+    userDuration: s.userDuration,
+  });
 
 export const MAX_FREE_TRIALS = 5;
 export const COST_PER_MOVIE = 5; // 5 credits per movie
@@ -37,6 +47,8 @@ export interface SceneItem {
   imageFile?: File;
   imageUrl?: string;
   imageDuration?: number;
+  /** Thời lượng bạn tự đặt (giây). ƯU TIÊN SỐ 1; để trống = tự động theo giọng đọc/clip/ảnh */
+  userDuration?: number;
   motionStyle?: MotionStyle;
   /** kết quả phân tích ảnh để hiển thị: số khối nhận diện, chế độ */
   motionInfo?: { mode: 'slide' | 'photo'; blocks: number } | null;
@@ -148,6 +160,20 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
 
   // Script text area for auto-extraction
   const [bulkScript, setBulkScript] = useState<string>('');
+  const [musicMood, setMusicMood] = useState<MusicMood | 'none'>('none');
+  // 1 file ghi âm dài -> tự chia thành các đoạn (mỗi đoạn cho 1 cảnh)
+  const [voiceSplitOn, setVoiceSplitOn] = useState<boolean>(true);
+  // File âm thanh chưa rõ vai trò: chờ người dùng chọn Giọng đọc / Nhạc nền
+  const [pendingAudio, setPendingAudio] = useState<File[]>([]);
+  const [voiceSplitSec, setVoiceSplitSec] = useState<number>(8);
+  const [voiceSplitSnap, setVoiceSplitSnap] = useState<boolean>(true);
+  // 'seconds': mỗi đoạn ~N giây | 'scenes': chia đúng bằng số cảnh, theo tỉ lệ thời lượng bạn đặt / lượng chữ của từng cảnh
+  const [voiceSplitMode, setVoiceSplitMode] = useState<'seconds' | 'scenes'>('scenes');
+  const [voiceSplitNote, setVoiceSplitNote] = useState<string>('');
+  const [isIngesting, setIsIngesting] = useState(false);
+  const [ingestMessage, setIngestMessage] = useState('');
+  /** Kịch bản đã tải lên nhưng chưa có cảnh nào để gắn vào */
+  const pendingScriptRef = useRef<string>('');
   const [showScriptModal, setShowScriptModal] = useState<boolean>(false);
 
   // --- Processing / Render State ---
@@ -226,18 +252,14 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   };
 
   // Helper: Load audio duration
-  const loadAudioDuration = (_file: File | Blob, url: string): Promise<number> => {
-    return new Promise((resolve) => {
-      const a = document.createElement('audio');
-      a.preload = 'metadata';
-      a.src = url;
-      a.onloadedmetadata = () => {
-        resolve(a.duration || 3);
-      };
-      a.onerror = () => {
-        resolve(3);
-      };
-    });
+  const loadAudioDuration = async (file: File | Blob, url: string): Promise<number> => {
+    const d = await robustAudioDuration(file, url);
+    if (d !== null) return d;
+    const name = (file as File).name || '';
+    alert(isVN
+      ? `Không đọc được file âm thanh "${name}". Trình duyệt không hỗ trợ định dạng này (ví dụ .wma, .amr, file ghi âm lạ). Hãy đổi sang MP3 hoặc WAV rồi tải lại.`
+      : `Could not read audio file "${name}". The browser does not support this format. Please convert to MP3 or WAV and try again.`);
+    return 3;
   };
 
   // --- Handlers: Upload Video Clips ---
@@ -282,7 +304,7 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
       im.src = url;
     });
 
-  const handleAddImages = async (files: FileList | File[]) => {
+  const handleAddImages = async (files: FileList | File[], texts?: Record<string, string>) => {
     const fileArray = Array.from(files).filter(f => f.type.startsWith('image/') || f.name.match(/\.(png|jpe?g|webp|bmp|gif)$/i));
     if (fileArray.length === 0) return;
 
@@ -302,6 +324,7 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
         imageDuration: imageSeconds,
         motionStyle: imageStyle,
         motionInfo: null,
+        subtitleText: texts?.[file.name] || undefined,
         videoUrl: '',
         videoName: file.name,
         videoDuration: imageSeconds,
@@ -331,9 +354,83 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
     setScenes(prev => prev.map(s => (s.kind === 'image' ? { ...s, motionStyle: imageStyle, imageDuration: imageSeconds, videoDuration: imageSeconds } : s)));
 
   // --- Handlers: Upload Voice Files Manually ---
+  const scenesRef = useRef<SceneItem[]>([]);
+  scenesRef.current = scenes;
+
+  const chooseAudioRole = async (file: File, role: 'voice' | 'music' | 'skip') => {
+    setPendingAudio(prev => prev.filter(f => f !== file));
+    if (role === 'voice') await handleAddVoices([file]);
+    else if (role === 'music') await handleAddBgm(file);
+  };
+
+  const assignSplitVoice = async (file: File) => {
+    try {
+      // Chế độ 'scenes': trọng số của mỗi cảnh = thời lượng bạn đặt, nếu không có thì theo lượng chữ / số khối chữ
+      const cur = scenesRef.current.filter(sc => sc.videoUrl || sc.imageUrl);
+      const useScenes = voiceSplitMode === 'scenes' && cur.length >= 2;
+      const weights = useScenes
+        ? cur.map(sc => sc.userDuration ?? (sc.subtitleText?.trim().length ? sc.subtitleText.trim().length : (sc.motionInfo?.blocks ? sc.motionInfo.blocks * 12 : 30)))
+        : undefined;
+      const segs = await splitVoiceFile(file, voiceSplitSec, 'voice', voiceSplitSnap, weights);
+      const data = segs.map(sg => {
+        const url = URL.createObjectURL(sg.file);
+        cleanupUrlsRef.current.push(url);
+        return { file: sg.file, url, duration: sg.duration };
+      });
+      let extra = 0;
+      let missing = 0;
+      setScenes(prev => {
+        const updated = [...prev];
+        // Chế độ theo cảnh: chỉ gán cho các cảnh đã có hình/video; chế độ theo giây: gán lần lượt cho mọi cảnh
+        const idxs = useScenes
+          ? prev.map((sc, i) => (sc.videoUrl || sc.imageUrl ? i : -1)).filter(i => i >= 0)
+          : prev.map((_, i) => i);
+        extra = Math.max(0, data.length - idxs.length);
+        missing = Math.max(0, idxs.length - data.length);
+        let nextOrder = updated.reduce((m, sc) => Math.max(m, sc.order), 0);
+        data.forEach((v, i) => {
+          const voice = { voiceFile: v.file, voiceUrl: v.url, voiceName: v.file.name, voiceDuration: v.duration };
+          if (i < idxs.length) updated[idxs[i]] = { ...updated[idxs[i]], ...voice };
+          else {
+            nextOrder += 1;
+            updated.push({
+              id: `scene_${Date.now()}_${i}`,
+              order: nextOrder,
+              videoUrl: '',
+              videoName: isVN ? `Chưa có video/ảnh cảnh ${i + 1}` : `No video/image for scene ${i + 1}`,
+              videoDuration: v.duration,
+              videoWidth: 1920,
+              videoHeight: 1080,
+              ...voice,
+            });
+          }
+        });
+        return updated;
+      });
+      const total = segs.reduce((t, sg) => t + sg.duration, 0);
+      setVoiceSplitNote(isVN
+        ? `✅ Đã chia file ghi âm (${total.toFixed(1)}s) thành ${segs.length} đoạn${useScenes ? ' theo tỉ lệ từng cảnh (dùng HẾT giọng đọc)' : ` ~${voiceSplitSec}s`}, gán lần lượt cho các cảnh.${extra ? ` Còn ${extra} đoạn chưa có hình: hãy thêm ảnh/video cho các cảnh cuối.` : ''}${missing ? ` Có ${missing} cảnh cuối chưa có voice (file ghi âm hết trước).` : ''}`
+        : `✅ Voice (${total.toFixed(1)}s) split into ${segs.length} parts of ~${voiceSplitSec}s.`);
+    } catch (e: any) {
+      alert(isVN
+        ? `Không chia được file ghi âm: ${e?.message || e}. Hãy thử đổi sang MP3 hoặc WAV.`
+        : `Could not split the voice file: ${e?.message || e}. Try MP3 or WAV.`);
+    }
+  };
+
   const handleAddVoices = async (files: FileList | File[]) => {
     const fileArray = Array.from(files).filter(f => f.type.startsWith('audio/') || f.name.match(/\.(wav|mp3|m4a|aac|ogg|flac)$/i));
     if (fileArray.length === 0) return;
+
+    // 1 file ghi âm dài -> chia thành nhiều đoạn, mỗi đoạn lồng cho 1 cảnh
+    if (fileArray.length === 1 && voiceSplitOn) {
+      const only = fileArray[0];
+      const url0 = URL.createObjectURL(only);
+      cleanupUrlsRef.current.push(url0);
+      const d0 = await loadAudioDuration(only, url0);
+      const visualScenes = scenesRef.current.filter(sc => sc.videoUrl || sc.imageUrl).length;
+      if ((voiceSplitMode === 'scenes' && visualScenes >= 2) || d0 > voiceSplitSec * 1.2) { await assignSplitVoice(only); return; }
+    }
 
     const voiceDataList = await Promise.all(
       fileArray.map(async (file) => {
@@ -582,6 +679,108 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
   };
 
   // Auto assign script text to scenes
+  // --- Ô kéo thả duy nhất: nhận mọi loại file, tự phân loại ---
+  const applyScriptText = (text: string) => {
+    setScenes(prev => {
+      if (prev.length === 0) { pendingScriptRef.current = text; return prev; }
+      pendingScriptRef.current = '';
+      const { lines } = splitScriptToScenes(text, prev.length);
+      return prev.map((sc, i) => (lines[i] ? { ...sc, subtitleText: lines[i] } : sc));
+    });
+  };
+
+  useEffect(() => {
+    if (scenes.length > 0 && pendingScriptRef.current) applyScriptText(pendingScriptRef.current);
+  }, [scenes.length]);
+
+  const handleUniversalFiles = async (files: File[]) => {
+    setIsIngesting(true);
+    setIngestMessage('');
+    try {
+      const res = await ingestFiles(files, { readPdf: readPdfInBrowser, collectPdfs: true });
+      const notes: string[] = [];
+
+      if (res.videos.length) await handleAddVideos(res.videos);
+      if (res.images.length) await handleAddImages(res.images);
+
+      // PDF thả riêng (chưa có cảnh, không kèm ảnh/video) -> mỗi TRANG là 1 cảnh slide, chữ của trang làm phụ đề.
+      // Ngược lại -> dùng chữ trong PDF làm kịch bản.
+      const pdfAsSlides = res.pdfs.length > 0 && res.videos.length + res.images.length === 0 && scenes.length === 0;
+      let pdfPages = 0;
+      for (const pdf of res.pdfs) {
+        if (pdfAsSlides) {
+          const pages = await renderPdfPages(pdf.file);
+          const texts: Record<string, string> = {};
+          pages.files.forEach((f, i) => { if (pages.pageTexts[i]) texts[f.name] = pages.pageTexts[i]; });
+          await handleAddImages(pages.files, texts);
+          pdfPages += pages.files.length;
+          if (pages.truncated) notes.push(isVN ? `PDF "${pdf.file.name}" quá dài: chỉ lấy 60 trang đầu.` : `PDF "${pdf.file.name}" is long: first 60 pages only.`);
+        } else if (pdf.scanned) {
+          notes.push(isVN ? `PDF "${pdf.file.name}" là dạng ảnh scan, không có chữ để làm kịch bản.` : `PDF "${pdf.file.name}" is scanned (no text).`);
+        } else {
+          res.scripts.push({ name: pdf.file.name, text: pdf.text });
+        }
+      }
+
+      // Âm thanh: phân biệt voice và nhạc nền
+      let voices = 0;
+      let music = 0;
+      if (res.audios.length) {
+        const probes = await Promise.all(res.audios.map(async f => {
+          const url = URL.createObjectURL(f);
+          const duration = await loadAudioDuration(f, url);
+          URL.revokeObjectURL(url);
+          const n = parseSceneNumber(f.name);
+          return { file: f, name: f.name, duration, number: n };
+        }));
+        const classified = classifyAudioBatch(probes);
+        // Chỉ tự xếp những file RÕ RÀNG (tên có "voice/giọng/nhạc/music..." hoặc số cảnh). File mơ hồ thì HỎI, không đoán nữa
+        // để nhạc nền không bị nhầm thành voice và tạo cảnh thừa ở cuối video.
+        const sure = classified.filter(c => !c.guessed);
+        const unsure = classified.filter(c => c.guessed);
+        const voiceFiles = sure.filter(c => c.role === 'voice').map(c => (c.item as typeof probes[number]).file);
+        const musicItem = sure.find(c => c.role === 'music');
+        if (voiceFiles.length) { await handleAddVoices(voiceFiles); voices = voiceFiles.length; }
+        if (musicItem) { await handleAddBgm((musicItem.item as typeof probes[number]).file); music = 1; }
+        if (unsure.length) {
+          setPendingAudio(prev => [...prev, ...unsure.map(c => (c.item as typeof probes[number]).file)]);
+          notes.push(isVN
+            ? `${unsure.length} file âm thanh chưa rõ là GIỌNG ĐỌC hay NHẠC NỀN: hãy bấm chọn ở khung bên dưới.`
+            : `${unsure.length} audio file(s): please choose VOICE or MUSIC below.`);
+        }
+      }
+
+      // Kịch bản (PDF / TXT / SRT)
+      let scriptNote = '';
+      if (res.scripts.length) {
+        const text = res.scripts.map(sc => sc.text).join('\n\n');
+        applyScriptText(text);
+        scriptNote = isVN ? `kịch bản từ ${res.scripts.length} file` : `script from ${res.scripts.length} file(s)`;
+      }
+
+      const parts: string[] = [];
+      if (res.videos.length) parts.push(isVN ? `${res.videos.length} video` : `${res.videos.length} video(s)`);
+      if (pdfPages) parts.push(isVN ? `${pdfPages} trang PDF (mỗi trang 1 cảnh)` : `${pdfPages} PDF page(s)`);
+      if (res.images.length) parts.push(isVN ? `${res.images.length} ảnh` : `${res.images.length} image(s)`);
+      if (voices) parts.push(isVN ? `${voices} voice` : `${voices} voice(s)`);
+      if (music) parts.push(isVN ? '1 nhạc nền' : '1 music track');
+      if (scriptNote) parts.push(scriptNote);
+      if (res.zipsOpened) parts.push(isVN ? `(đã mở ${res.zipsOpened} file ZIP)` : `(${res.zipsOpened} ZIP opened)`);
+
+      const lines: string[] = [];
+      lines.push(parts.length
+        ? `✅ ${isVN ? 'Đã nhận' : 'Received'}: ${parts.join(', ')}.`
+        : (isVN ? '⚠️ Không nhận được file hợp lệ nào.' : '⚠️ No valid files received.'));
+      for (const w of [...res.warnings, ...notes]) lines.push(`• ${w}`);
+      setIngestMessage(lines.join('\n'));
+    } catch (err: any) {
+      console.error('Lỗi khi đọc file:', err);
+      setIngestMessage(`⚠️ ${isVN ? 'Không đọc được file' : 'Could not read files'}: ${err?.message || err}`);
+    } finally {
+      setIsIngesting(false);
+    }
+  };
+
   const applyBulkScript = () => {
     if (!bulkScript.trim()) {
       setShowScriptModal(false);
@@ -610,6 +809,7 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
       id: sc.id,
       kind: sc.kind,
       imageDuration: sc.imageDuration,
+      userDuration: sc.userDuration,
       videoDuration: sc.videoDuration,
       videoWidth: sc.videoWidth,
       videoHeight: sc.videoHeight,
@@ -674,10 +874,11 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
           settings: {
             aspectRatio, fitMode, quality,
             enableSubtitles, subtitleStyle,
-            enableBgm: enableBgm && !!bgmUrl,
+            enableBgm: enableBgm && (!!bgmUrl || musicMood !== 'none'),
             bgmVolume,
           },
           bgm: bgmUrl ? { url: bgmUrl, name: bgmName || 'bgm.mp3' } : undefined,
+          generatedMusic: !bgmUrl && enableBgm && musicMood !== 'none' ? musicMood : null,
         },
         {
           signal: controller.signal,
@@ -857,6 +1058,32 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
         {/* Left Column (8/12) */}
         <div className="lg:col-span-8 flex flex-col gap-3.5">
           
+          {/* Một ô kéo thả cho tất cả: video, ảnh, voice, nhạc, PDF/TXT, ZIP */}
+          <UniversalDropZone
+            isVN={isVN}
+            busy={isIngesting}
+            message={ingestMessage}
+            onFiles={handleUniversalFiles}
+            onDismissMessage={() => setIngestMessage('')}
+          />
+
+          {/* File âm thanh chưa rõ vai trò: người dùng chọn, tool không đoán */}
+          {pendingAudio.length > 0 && (
+            <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl px-3 py-2 text-[11px] text-amber-100 space-y-1.5">
+              <div className="font-bold">
+                {isVN ? 'Chọn vai trò cho file âm thanh (tool không đoán nữa để khỏi nhầm nhạc nền thành giọng đọc):' : 'Choose a role for these audio files:'}
+              </div>
+              {pendingAudio.map((f, i) => (
+                <div key={`${f.name}-${i}`} className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono truncate max-w-[16rem]">{f.name}</span>
+                  <button type="button" onClick={() => chooseAudioRole(f, 'voice')} className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-bold">{isVN ? 'Giọng đọc' : 'Voice'}</button>
+                  <button type="button" onClick={() => chooseAudioRole(f, 'music')} className="px-2 py-0.5 rounded-md bg-indigo-600 text-white font-bold">{isVN ? 'Nhạc nền' : 'Music'}</button>
+                  <button type="button" onClick={() => chooseAudioRole(f, 'skip')} className="px-2 py-0.5 rounded-md bg-slate-700 text-slate-200">{isVN ? 'Bỏ qua' : 'Skip'}</button>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Top 3 Quick Upload Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5">
             {/* 1. Add Videos */}
@@ -1091,6 +1318,38 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
               </span>
             </div>
 
+            {/* Chia 1 file ghi âm dài cho nhiều cảnh */}
+            <div className="flex flex-wrap items-center gap-2 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2 text-[11px] text-slate-200">
+              <Mic size={14} className="text-emerald-400 shrink-0" />
+              <label className="flex items-center gap-1.5 cursor-pointer font-bold">
+                <input type="checkbox" checked={voiceSplitOn} onChange={(e) => setVoiceSplitOn(e.target.checked)} className="accent-emerald-500" />
+                {isVN ? 'Chia 1 file ghi âm dài cho nhiều cảnh' : 'Split one long voice file across scenes'}
+              </label>
+              <select
+                value={voiceSplitMode}
+                onChange={(e) => setVoiceSplitMode(e.target.value as 'seconds' | 'scenes')}
+                className="bg-slate-950 border border-slate-700 rounded-md px-1.5 py-1 outline-none focus:border-emerald-400"
+              >
+                <option value="scenes">{isVN ? 'đúng số cảnh, theo tỉ lệ chữ/thời lượng từng cảnh' : 'per scene, proportional'}</option>
+                <option value="seconds">{isVN ? 'mỗi đoạn N giây' : 'N seconds each'}</option>
+              </select>
+              {voiceSplitMode === 'seconds' && (
+                <>
+                  <input
+                    type="number" min={2} max={120} step={0.5} value={voiceSplitSec}
+                    onChange={(e) => setVoiceSplitSec(Math.max(2, Math.min(120, Number(e.target.value) || 8)))}
+                    className="w-16 bg-slate-950 border border-slate-700 rounded-md px-2 py-1 text-center outline-none focus:border-emerald-400"
+                  />
+                  <span>{isVN ? 'giây' : 's'}</span>
+                </>
+              )}
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input type="checkbox" checked={voiceSplitSnap} onChange={(e) => setVoiceSplitSnap(e.target.checked)} className="accent-emerald-500" />
+                {isVN ? 'cắt ở chỗ ngắt nghỉ (bỏ chọn = cắt đúng từng N giây)' : 'cut at pauses (off = exact N seconds)'}
+              </label>
+              {voiceSplitNote && <div className="basis-full text-[10px] text-emerald-300 whitespace-pre-line">{voiceSplitNote}</div>}
+            </div>
+
             {/* Image defaults bar */}
             {scenes.some(sc => sc.kind === 'image') && (
               <div className="flex flex-wrap items-center gap-2 bg-amber-950/20 border border-amber-800/40 rounded-xl px-3 py-2 text-[11px] text-amber-100">
@@ -1179,7 +1438,7 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                             {scene.videoName}
                           </span>
                           <span className="text-[10px] bg-slate-850 text-indigo-300 px-1.5 py-0.2 rounded font-bold border border-indigo-900/60">
-                            {(scene.kind === 'image' ? imageSceneDuration(scene) : scene.videoDuration).toFixed(1)}s
+                            {sceneInfoOf(scene).seconds.toFixed(1)}s
                           </span>
                         </div>
 
@@ -1221,18 +1480,6 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                               <option value="kenburns">{isVN ? 'Zoom nhẹ' : 'Gentle zoom'}</option>
                               <option value="none">{isVN ? 'Đứng yên' : 'Static'}</option>
                             </select>
-                            {!scene.voiceUrl ? (
-                              <label className="flex items-center gap-1">
-                                <input
-                                  type="number" min={2.5} max={60} step={0.5} value={scene.imageDuration ?? DEFAULT_IMAGE_SECONDS}
-                                  onChange={(e) => { const v = Math.max(2.5, Math.min(60, Number(e.target.value) || DEFAULT_IMAGE_SECONDS)); updateImageScene(scene.id, { imageDuration: v, videoDuration: v }); }}
-                                  className="w-12 bg-slate-900 border border-slate-700 rounded-md px-1 py-0.5 text-[10px] text-slate-100 outline-none focus:border-amber-400"
-                                />
-                                <span>{isVN ? 'giây' : 'sec'}</span>
-                              </label>
-                            ) : (
-                              <span className="text-emerald-400">{isVN ? 'độ dài theo giọng đọc' : 'length follows voice'}</span>
-                            )}
                             <span className="text-slate-400">
                               {scene.motionInfo === null || scene.motionInfo === undefined
                                 ? (isVN ? 'Đang phân tích ảnh…' : 'Analyzing…')
@@ -1242,6 +1489,45 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                             </span>
                           </div>
                         )}
+
+                        {/* Thời lượng cảnh (ảnh và video): bạn đặt > giọng đọc > mặc định / clip gốc */}
+                        {(() => {
+                          const info = sceneInfoOf(scene);
+                          const voiceLen = scene.voiceUrl && scene.voiceDuration ? VOICE_LEAD + scene.voiceDuration + VOICE_TAIL : 0;
+                          const cut = scene.userDuration && voiceLen > scene.userDuration + 0.05 ? voiceLen - scene.userDuration : 0;
+                          const loops = scene.kind !== 'image' && scene.userDuration && scene.videoDuration > 0 && scene.userDuration > scene.videoDuration + 0.05;
+                          const sourceText = info.source === 'user' ? (isVN ? 'do bạn đặt' : 'set by you')
+                            : info.source === 'voice' ? (isVN ? 'theo giọng đọc' : 'follows voice')
+                            : info.source === 'image' ? (isVN ? 'mặc định của ảnh' : 'image default')
+                            : (isVN ? 'theo độ dài clip' : 'clip length');
+                          return (
+                            <div className="flex flex-wrap items-center gap-2 mt-1.5 text-[10px] text-slate-300">
+                              <label className="flex items-center gap-1">
+                                <span>{isVN ? 'Thời lượng cảnh' : 'Scene length'}</span>
+                                <input
+                                  type="number" min={0.5} max={600} step={0.5}
+                                  value={scene.userDuration ?? ''}
+                                  placeholder={info.seconds.toFixed(1)}
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    const v = raw === '' ? undefined : Math.max(0.5, Math.min(600, Number(raw) || 0.5));
+                                    updateImageScene(scene.id, { userDuration: v });
+                                  }}
+                                  className="w-16 bg-slate-900 border border-slate-700 rounded-md px-1 py-0.5 text-[10px] text-slate-100 outline-none focus:border-amber-400"
+                                />
+                                <span>{isVN ? 'giây' : 'sec'}</span>
+                              </label>
+                              <span className={info.source === 'user' ? 'text-amber-300' : 'text-emerald-400'}>{sourceText}</span>
+                              {scene.userDuration !== undefined && (
+                                <button type="button" onClick={() => updateImageScene(scene.id, { userDuration: undefined })} className="text-slate-400 underline">
+                                  {isVN ? 'về tự động' : 'auto'}
+                                </button>
+                              )}
+                              {cut > 0 && <span className="text-red-400">{isVN ? `⚠ giọng đọc bị cắt ${cut.toFixed(1)}s` : `⚠ voice cut by ${cut.toFixed(1)}s`}</span>}
+                              {loops && <span className="text-amber-300">{isVN ? 'clip ngắn hơn: sẽ lặp lại cho đủ' : 'clip shorter: will loop'}</span>}
+                            </div>
+                          );
+                        })()}
 
                         {/* Subtitle text input */}
                         <input
@@ -1439,6 +1725,41 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                     onChange={(e) => setBgmVolume(parseInt(e.target.value, 10))}
                     className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500"
                   />
+                  {!bgmUrl && (
+                    <div className="pt-1">
+                      <div className="text-[9px] font-black uppercase text-slate-400 mb-1">
+                        {isVN ? 'Hoặc tự tạo nhạc nền (miễn phí):' : 'Or generate music (free):'}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {(['none', ...MUSIC_MOODS] as const).map(m => {
+                          const label: Record<string, string> = isVN
+                            ? { none: 'Không', calm: 'Nhẹ nhàng', warm: 'Ấm áp', cinematic: 'Điện ảnh', upbeat: 'Sôi động' }
+                            : { none: 'None', calm: 'Calm', warm: 'Warm', cinematic: 'Cinematic', upbeat: 'Upbeat' };
+                          const disabled = m !== 'none' && engineKind !== 'server';
+                          return (
+                            <button
+                              key={m}
+                              type="button"
+                              disabled={disabled}
+                              onClick={() => setMusicMood(m)}
+                              className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border transition active:scale-95 ${
+                                musicMood === m
+                                  ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                  : 'bg-slate-950 text-slate-300 border-slate-700 hover:border-slate-500'
+                              } ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            >
+                              {label[m]}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {engineKind !== 'server' && (
+                        <div className="text-[9px] text-amber-300/80 mt-1">
+                          {isVN ? 'Cần bật máy dựng để tự tạo nhạc.' : 'Requires the render engine to generate music.'}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div className="flex items-center justify-between text-[9px] text-slate-500 font-bold">
                     <span>{isVN ? 'Nhỏ' : 'Low'}</span>
                     <span className="text-emerald-400 font-black">

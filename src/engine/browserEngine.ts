@@ -131,6 +131,7 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
     id: s.id,
     kind: s.kind === 'image' ? 'image' as const : 'video' as const,
     imageDuration: s.kind === 'image' ? s.imageDuration : undefined,
+    userDuration: s.userDuration,
     videoDuration: s.videoDuration,
     videoWidth: s.videoWidth,
     videoHeight: s.videoHeight,
@@ -161,6 +162,7 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
 
   let bgmEl: HTMLAudioElement | null = null;
   let bgmGain: GainNode | null = null;
+  let bgmFade: GainNode | null = null; // mờ dần vào / ra (giống máy dựng FFmpeg)
   const bgmBase = Math.max(0, Math.min(1, settings.bgmVolume / 100));
   if (settings.enableBgm && req.bgm) {
     bgmEl = new Audio(req.bgm.url);
@@ -169,8 +171,11 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
     const src = audioCtx.createMediaElementSource(bgmEl);
     bgmGain = audioCtx.createGain();
     bgmGain.gain.value = bgmBase;
+    bgmFade = audioCtx.createGain();
+    bgmFade.gain.value = 0;
     src.connect(bgmGain);
-    bgmGain.connect(audioDest);
+    bgmGain.connect(bgmFade);
+    bgmFade.connect(audioDest);
   }
 
   const canvasStream = canvas.captureStream(timeline.fps);
@@ -205,11 +210,26 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
     if (bgmEl) {
       bgmEl.currentTime = 0;
       await bgmEl.play().catch(() => warnings.push('Không phát được nhạc nền, phim có thể thiếu nhạc.'));
+      if (bgmFade) {
+        const t0 = audioCtx.currentTime;
+        const fadeIn = Math.min(1, timeline.totalDuration / 3);
+        bgmFade.gain.setValueAtTime(0, t0);
+        bgmFade.gain.linearRampToValueAtTime(1, t0 + fadeIn);
+      }
     }
 
     for (const scene of timeline.scenes) {
       if (cb.signal.aborted) throw new RenderCancelled();
       const src = usable[scene.index];
+      // Cảnh cuối: nhạc nền nhỏ dần về 0 đúng lúc phim kết thúc
+      if (bgmFade && scene.index === timeline.scenes.length - 1) {
+        const now = audioCtx.currentTime;
+        const d = Math.min(2, scene.duration * 0.9);
+        bgmFade.gain.cancelScheduledValues(now);
+        bgmFade.gain.setValueAtTime(timeline.scenes.length === 1 ? 1 : bgmFade.gain.value, now);
+        bgmFade.gain.setValueAtTime(1, now + Math.max(0, scene.duration - d));
+        bgmFade.gain.linearRampToValueAtTime(0, now + scene.duration);
+      }
       cb.onProgress(
         Math.min(94, 3 + Math.round((scene.start / timeline.totalDuration) * 90)),
         `Đang dựng cảnh ${scene.index + 1}/${timeline.scenes.length}...`,
@@ -292,6 +312,10 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
   const url = URL.createObjectURL(blob);
 
   if (!isMp4) warnings.push('Trình duyệt này chỉ xuất được định dạng WebM. Dùng Chrome/Edge mới hoặc bật máy dựng để có MP4 chuẩn.');
+
+  if (!req.bgm && req.generatedMusic && settings.enableBgm) {
+    warnings.push('Nhạc nền tự tạo cần máy dựng. Hãy bật máy dựng hoặc tải nhạc của bạn lên.');
+  }
 
   return {
     engine: 'browser',
