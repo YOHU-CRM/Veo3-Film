@@ -28,7 +28,11 @@ export interface RenderSettings {
 }
 
 /** Thông tin 1 cảnh đã đọc xong (kích thước, thời lượng) – dùng để lập timeline. */
+export interface SubtitleCueSpec { start: number; end: number; text: string }
+
 export interface SceneSpec {
+  /** Dòng phụ đề có thời điểm (giây, tính từ ĐẦU giọng đọc của cảnh) lấy từ nhận dạng giọng nói. Ưu tiên hơn subtitleText */
+  subtitleCues?: SubtitleCueSpec[];
   /** Thời lượng người dùng tự đặt (giây). ƯU TIÊN SỐ 1, cao hơn thời lượng voice và độ dài clip */
   userDuration?: number;
   id: string;
@@ -102,6 +106,7 @@ export interface RenderManifest {
     hasVideo: boolean;
     /** cảnh ảnh: file gửi kèm với tên field i_<id> */
     hasImage?: boolean;
+    subtitleCues?: SubtitleCueSpec[];
     imageDuration?: number;
     /** Thời lượng người dùng đặt (giây): ưu tiên số 1 */
     userDuration?: number;

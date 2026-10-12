@@ -155,3 +155,41 @@ test('timeline: cảnh đặt thời lượng ngắn hơn voice thì cảnh đú
   assert.equal(tl.scenes[1].loop, true);
   assert.ok(Math.abs(estimateTotalDuration(specs) - tl.totalDuration) < 1e-6);
 });
+
+
+// ───────── Phụ đề lấy từ giọng đọc (có thời điểm) ─────────
+test('phụ đề theo giọng: hiện đúng thời điểm người nói, tính từ đầu giọng đọc', () => {
+  const specs: SceneSpec[] = [{
+    id: 'a', kind: 'video', videoDuration: 12, videoWidth: 1920, videoHeight: 1080, voiceDuration: 8,
+    subtitleText: 'bỏ qua',
+    subtitleCues: [
+      { start: 0.0, end: 2.0, text: 'Xin chào các bạn.' },
+      { start: 3.0, end: 5.0, text: 'Hôm nay ta nói về hệ sinh thái.' },
+    ],
+  }];
+  const cues = buildTimeline(specs, settings).scenes[0].cues;
+  assert.ok(cues.length >= 2);
+  assert.ok(Math.abs(cues[0].start - VOICE_LEAD) < 1e-6);
+  const second = cues.find(c => c.text.includes('Hôm nay'));
+  assert.ok(second && Math.abs(second.start - (VOICE_LEAD + 3)) < 1e-6);
+  assert.ok(!cues.some(c => c.text.includes('bỏ qua')));
+});
+
+test('phụ đề theo giọng: cảnh đặt ngắn hơn thì dòng nằm ngoài cảnh bị bỏ', () => {
+  const specs: SceneSpec[] = [{
+    id: 'a', kind: 'video', videoDuration: 12, videoWidth: 1920, videoHeight: 1080, voiceDuration: 8, userDuration: 3,
+    subtitleCues: [{ start: 0, end: 2, text: 'Câu đầu.' }, { start: 5, end: 7, text: 'Câu sau.' }],
+  }];
+  const tl = buildTimeline(specs, settings);
+  assert.ok(tl.scenes[0].cues.every(c => c.end <= tl.scenes[0].duration + 1e-6));
+  assert.ok(!tl.scenes[0].cues.some(c => c.text.includes('Câu sau')));
+});
+
+test('không có giọng đọc thì bỏ qua subtitleCues, dùng chữ như cũ', () => {
+  const specs: SceneSpec[] = [{
+    id: 'a', kind: 'video', videoDuration: 6, videoWidth: 1920, videoHeight: 1080,
+    subtitleText: 'Chữ thường.', subtitleCues: [{ start: 0, end: 2, text: 'Không dùng.' }],
+  }];
+  const cues = buildTimeline(specs, settings).scenes[0].cues;
+  assert.ok(cues.some(c => c.text.includes('Chữ thường')));
+});

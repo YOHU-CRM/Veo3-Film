@@ -248,7 +248,15 @@ export function buildTimeline(scenes: SceneSpec[], settings: RenderSettings): Ti
     const duration = frames / FPS;
 
     let cues: SubtitleCue[] = [];
-    if (settings.enableSubtitles && scene.subtitleText?.trim()) {
+    if (settings.enableSubtitles && voice > 0 && scene.subtitleCues && scene.subtitleCues.length > 0) {
+      // Phụ đề lấy từ chính giọng đọc: mỗi dòng hiện đúng lúc người nói đọc tới đó
+      for (const c of scene.subtitleCues) {
+        const from = VOICE_LEAD + c.start;
+        if (from >= duration) continue;
+        const to = Math.min(duration, VOICE_LEAD + c.end);
+        cues.push(...allocateCues(splitSubtitleText(c.text, maxChars), from, Math.max(to, from + 0.2)));
+      }
+    } else if (settings.enableSubtitles && scene.subtitleText?.trim()) {
       const pieces = splitSubtitleText(scene.subtitleText, maxChars);
       cues = voice > 0
         ? allocateCues(pieces, VOICE_LEAD, Math.min(duration, VOICE_LEAD + voice + 0.15))
