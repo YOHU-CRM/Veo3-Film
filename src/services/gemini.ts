@@ -1505,3 +1505,86 @@ export const generateGeminiVoice = async (
   }
   throw lastError;
 };
+
+// ───────────────────────────────────────────────────────────────
+//  NHẬN DẠNG GIỌNG NÓI -> PHỤ ĐỀ (mỗi dòng có thời điểm bắt đầu/kết thúc)
+// ───────────────────────────────────────────────────────────────
+import { parseTranscriptJson, geminiAudioMime, type TranscriptCue } from './transcriptParse';
+export type { TranscriptCue } from './transcriptParse';
+
+const blobToBase64 = async (blob: Blob): Promise<string> => {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  let bin = '';
+  const CH = 0x8000;
+  for (let i = 0; i < buf.length; i += CH) bin += String.fromCharCode(...buf.subarray(i, i + CH));
+  return btoa(bin);
+};
+
+/**
+ * Nghe file âm thanh và chép lại ĐÚNG lời nói, chia thành các dòng phụ đề ngắn theo dấu câu,
+ * kèm thời điểm (giây, tính từ đầu file). Dùng khóa API như các tính năng AI khác.
+ */
+export const transcribeAudioGemini = async (
+  audio: Blob,
+  durationSec: number,
+  apiKeys: string[],
+  lang: 'EN' | 'VN' = 'VN',
+  useProjectKey: boolean = true,
+  adminFreeKeys: string[] = [],
+  adminPaidKeys: string[] = [],
+): Promise<TranscriptCue[]> => {
+  const { freeKeys, paidKeys } = resolveImageKeys(apiKeys, adminFreeKeys, adminPaidKeys);
+  const tiered = useProjectKey && (freeKeys.length > 0 || paidKeys.length > 0);
+  const freeSet = new Set(freeKeys);
+  const keys: string[] = tiered
+    ? Array.from(new Set([...freeKeys, ...paidKeys, ...resolveKeys(apiKeys, useProjectKey)])).filter(Boolean)
+    : resolveKeys(apiKeys, useProjectKey);
+  if (keys.length === 0) {
+    const error = new Error('API Key missing. Please select an API key to continue.');
+    (error as any).isKeyError = true;
+    throw error;
+  }
+
+  const data = await blobToBase64(audio);
+  const mimeType = geminiAudioMime(audio.type, (audio as File).name || '');
+  const language = lang === 'VN' ? 'tiếng Việt' : 'English';
+  const prompt =
+    `Hãy NGHE file âm thanh (${language}) và chép lại CHÍNH XÁC những gì người nói đã nói, từng chữ, không sửa, không thêm, không bỏ.\n` +
+    `Chia thành các dòng phụ đề NGẮN theo dấu câu: ngắt ở dấu chấm, phẩy, chấm hỏi, chấm than, chấm phẩy và khi hết một cụm trong dấu ngoặc. ` +
+    `Mỗi dòng tối đa khoảng 60 ký tự; câu dài thì chia thêm ở chỗ ngắt hơi tự nhiên.\n` +
+    `Thời gian (giây, số thập phân, tính từ ĐẦU file) phải là lúc người nói THỰC SỰ bắt đầu và kết thúc đọc dòng đó (bỏ qua đoạn im lặng).\n` +
+    `Chỉ trả về JSON thuần, không giải thích, theo dạng: [{"start":0.0,"end":2.4,"text":"..."}]. Nếu không có lời nói, trả về [].`;
+
+  let lastError: any = null;
+  for (const apiKey of keys) {
+    const ai = new GoogleGenAI({ apiKey });
+    const models = freeSet.has(apiKey) ? TEXT_FREE_MODELS : [...TEXT_FREE_MODELS, ...TEXT_PAID_MODELS];
+    for (const modelName of models) {
+      try {
+        const response: any = await withTimeout(
+          ai.models.generateContent({
+            model: modelName,
+            contents: [{ role: 'user', parts: [{ inlineData: { mimeType, data } }, { text: prompt }] }],
+            config: { responseMimeType: 'application/json', maxOutputTokens: 8192 },
+          }),
+          TEXT_CALL_TIMEOUT_MS,
+        );
+        let text: string = response.text || '';
+        if (!text && response.candidates?.length > 0) {
+          const parts = response.candidates[0]?.content?.parts;
+          if (parts) text = parts.map((p: any) => p.text || '').join('');
+        }
+        const cues = parseTranscriptJson(text, durationSec);
+        if (cues.length > 0 || /^\s*\[\s*\]\s*$/.test(text)) return cues;
+        throw new Error('EMPTY_RESPONSE: không đọc được kết quả nhận dạng');
+      } catch (e: any) {
+        lastError = e;
+        const msg = parseErrorMessage(e);
+        // Hết hạn mức hoặc khóa sai: đổi khóa khác ngay; lỗi còn lại: thử mô hình kế
+        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') ||
+            msg.includes('API key not valid') || msg.includes('401') || msg.includes('403')) break;
+      }
+    }
+  }
+  throw lastError || new Error('Không nhận dạng được giọng nói.');
+};

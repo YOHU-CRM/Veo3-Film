@@ -12,7 +12,7 @@ import { RenderCancelled, EngineError, type RenderCallbacks, type RenderRequest,
 import { ImageMotionScene, createBackdrop, drawImageSceneFrame, defaultCanvasFactory } from '../../shared/imageMotion';
 import { prepareImageFromUrl } from './imageCache';
 
-const DUCK_LEVEL = 0.22;
+const DUCK_LEVEL = 0.45;      // nhạc nền chỉ hạ còn ~45% khi có giọng đọc (trước đây 22%: quá nhỏ)
 
 function wrapLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines = 3): string[] {
   const words = text.split(/\s+/).filter(Boolean);
@@ -132,6 +132,7 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
     kind: s.kind === 'image' ? 'image' as const : 'video' as const,
     imageDuration: s.kind === 'image' ? s.imageDuration : undefined,
     userDuration: s.userDuration,
+    subtitleCues: s.voiceUrl ? s.subtitleCues : undefined,
     videoDuration: s.videoDuration,
     videoWidth: s.videoWidth,
     videoHeight: s.videoHeight,
@@ -283,7 +284,8 @@ export async function renderInBrowser(req: RenderRequest, cb: RenderCallbacks): 
         duck: (on: boolean) => {
           if (!bgmGain) return;
           const target = on ? bgmBase * DUCK_LEVEL : bgmBase;
-          bgmGain.gain.setTargetAtTime(target, audioCtx.currentTime, on ? 0.12 : 0.3);
+          // Hạ vừa phải, và LÊN LẠI CHẬM (không bật to đột ngột gây phân tâm)
+          bgmGain.gain.setTargetAtTime(target, audioCtx.currentTime, on ? 0.35 : 1.0);
         },
       });
 

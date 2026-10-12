@@ -105,6 +105,7 @@ export async function renderRemote(req: RenderRequest, cb: RenderCallbacks): Pro
       hasImage: s.kind === 'image' && !!s.imageUrl,
       imageDuration: s.kind === 'image' ? s.imageDuration : undefined,
       userDuration: s.userDuration,
+      subtitleCues: s.subtitleCues,
       motionStyle: s.kind === 'image' ? s.motionStyle : undefined,
       imageName: s.kind === 'image' ? s.videoName : undefined,
       hasVoice: !!s.voiceUrl || !!s.voiceFile,

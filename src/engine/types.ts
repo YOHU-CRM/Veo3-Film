@@ -1,6 +1,6 @@
-import type { MusicMood, RenderSettings, MotionStyle } from '../../shared/render/types';
+import type { MusicMood, RenderSettings, MotionStyle, SubtitleCueSpec } from '../../shared/render/types';
 
-export type { MusicMood, RenderSettings, MotionStyle };
+export type { MusicMood, RenderSettings, MotionStyle, SubtitleCueSpec };
 
 /** Một cảnh như giao diện đang giữ (clip + voice + chữ phụ đề) */
 export interface EngineScene {
@@ -12,6 +12,8 @@ export interface EngineScene {
   imageDuration?: number;
   /** Thời lượng người dùng đặt (giây): ưu tiên số 1 */
   userDuration?: number;
+  /** Phụ đề có thời điểm, lấy từ nhận dạng giọng nói (giây, tính từ đầu giọng đọc) */
+  subtitleCues?: SubtitleCueSpec[];
   motionStyle?: MotionStyle;
   videoFile?: File;
   videoUrl: string;

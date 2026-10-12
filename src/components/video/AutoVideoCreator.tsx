@@ -12,6 +12,7 @@ import { MUSIC_MOODS, type MusicMood, type MotionStyle } from '../../../shared/r
 import { UniversalDropZone } from './UniversalDropZone';
 import { classifyAudioBatch, ingestFiles, splitScriptToScenes } from '../../ingest';
 import { readPdfInBrowser, renderPdfPages } from '../../ingest/pdfBrowser';
+import { transcribeAudioGemini } from '../../services/gemini';
 import { robustAudioDuration, splitVoiceFile } from '../../utils/audioTools';
 import { describeImageMotion, releasePreparedImage } from '../../engine/imageCache';
 import {
@@ -49,6 +50,11 @@ export interface SceneItem {
   imageDuration?: number;
   /** Thời lượng bạn tự đặt (giây). ƯU TIÊN SỐ 1; để trống = tự động theo giọng đọc/clip/ảnh */
   userDuration?: number;
+  /** Phụ đề có thời điểm do AI nghe giọng đọc; chỉ dùng khi subtitleCuesFor trùng voiceUrl hiện tại */
+  subtitleCues?: { start: number; end: number; text: string }[];
+  subtitleCuesFor?: string;
+  /** Chữ phụ đề lúc nhận dạng; nếu chữ bị sửa sau đó thì bỏ phụ đề theo giọng, dùng chữ mới */
+  subtitleCuesText?: string;
   motionStyle?: MotionStyle;
   /** kết quả phân tích ảnh để hiển thị: số khối nhận diện, chế độ */
   motionInfo?: { mode: 'slide' | 'photo'; blocks: number } | null;
@@ -156,7 +162,7 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   const [enableSubtitles, setEnableSubtitles] = useState<boolean>(true);
   const [subtitleStyle, setSubtitleStyle] = useState<'yellow_stroke' | 'white_box'>('yellow_stroke');
   const [enableBgm, setEnableBgm] = useState<boolean>(true);
-  const [bgmVolume, setBgmVolume] = useState<number>(20); // 0 - 100%
+  const [bgmVolume, setBgmVolume] = useState<number>(35); // 0 - 100% (mặc định 35%: đủ nghe, vẫn chỉnh tay được)
 
   // Script text area for auto-extraction
   const [bulkScript, setBulkScript] = useState<string>('');
@@ -170,6 +176,10 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   // 'seconds': mỗi đoạn ~N giây | 'scenes': chia đúng bằng số cảnh, theo tỉ lệ thời lượng bạn đặt / lượng chữ của từng cảnh
   const [voiceSplitMode, setVoiceSplitMode] = useState<'seconds' | 'scenes'>('scenes');
   const [voiceSplitNote, setVoiceSplitNote] = useState<string>('');
+  const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
+  const [transcribeStatus, setTranscribeStatus] = useState<string>('');
+  // Các đoạn giọng đọc DƯ (chưa có cảnh): tự gán cho cảnh thêm sau
+  const [voiceReserve, setVoiceReserve] = useState<{ file: File; url: string; duration: number }[]>([]);
   const [isIngesting, setIsIngesting] = useState(false);
   const [ingestMessage, setIngestMessage] = useState('');
   /** Kịch bản đã tải lên nhưng chưa có cảnh nào để gắn vào */
@@ -357,6 +367,54 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   const scenesRef = useRef<SceneItem[]>([]);
   scenesRef.current = scenes;
 
+  // Nhờ AI nghe giọng đọc từng cảnh -> phụ đề đúng lời nói, hiện đúng lúc người đọc tới đó
+  const handleTranscribeVoices = async () => {
+    const targets = scenesRef.current.filter(sc => sc.voiceUrl && sc.voiceDuration);
+    if (targets.length === 0) {
+      alert(isVN ? 'Chưa có cảnh nào có giọng đọc để tạo phụ đề.' : 'No scene has a voice yet.');
+      return;
+    }
+    setIsTranscribing(true);
+    let ok = 0;
+    let fail = 0;
+    let lastMsg = '';
+    for (let i = 0; i < targets.length; i++) {
+      const sc = targets[i];
+      setTranscribeStatus(isVN ? `AI đang nghe giọng đọc ${i + 1}/${targets.length}...` : `Listening ${i + 1}/${targets.length}...`);
+      try {
+        const blob = await (await fetch(sc.voiceUrl as string)).blob();
+        const cues = await transcribeAudioGemini(blob, sc.voiceDuration as number, apiKeys, outputLanguage, useProjectKey, adminFreeKeys, adminPaidKeys);
+        if (cues.length === 0) { fail++; lastMsg = isVN ? 'không nghe thấy lời nói' : 'no speech'; continue; }
+        setScenes(prev => prev.map(s => s.id === sc.id
+          ? { ...s, subtitleCues: cues, subtitleCuesFor: sc.voiceUrl, subtitleCuesText: cues.map(c => c.text).join(' '), subtitleText: cues.map(c => c.text).join(' ') }
+          : s));
+        ok++;
+      } catch (e: any) {
+        fail++;
+        lastMsg = String(e?.message || e).slice(0, 120);
+      }
+    }
+    setIsTranscribing(false);
+    setTranscribeStatus(isVN
+      ? `✅ Đã tạo phụ đề theo giọng đọc cho ${ok} cảnh.${fail ? ` ${fail} cảnh chưa được (${lastMsg}).` : ''}`
+      : `✅ Subtitles created for ${ok} scene(s).${fail ? ` ${fail} failed (${lastMsg}).` : ''}`);
+  };
+
+  // Có cảnh mới (đã có hình, chưa có voice) và còn giọng dự trữ -> gán tiếp theo thứ tự
+  useEffect(() => {
+    if (voiceReserve.length === 0) return;
+    const need = scenes.filter(sc => (sc.videoUrl || sc.imageUrl) && !sc.voiceUrl).slice(0, voiceReserve.length);
+    if (need.length === 0) return;
+    const take = voiceReserve.slice(0, need.length);
+    setScenes(prev => prev.map(sc => {
+      const k = need.findIndex(n => n.id === sc.id);
+      if (k < 0) return sc;
+      const v = take[k];
+      return { ...sc, voiceFile: v.file, voiceUrl: v.url, voiceName: v.file.name, voiceDuration: v.duration };
+    }));
+    setVoiceReserve(prev => prev.slice(need.length));
+  }, [scenes, voiceReserve]);
+
   const chooseAudioRole = async (file: File, role: 'voice' | 'music' | 'skip') => {
     setPendingAudio(prev => prev.filter(f => f !== file));
     if (role === 'voice') await handleAddVoices([file]);
@@ -377,40 +435,24 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
         cleanupUrlsRef.current.push(url);
         return { file: sg.file, url, duration: sg.duration };
       });
-      let extra = 0;
-      let missing = 0;
-      setScenes(prev => {
-        const updated = [...prev];
-        // Chế độ theo cảnh: chỉ gán cho các cảnh đã có hình/video; chế độ theo giây: gán lần lượt cho mọi cảnh
-        const idxs = useScenes
-          ? prev.map((sc, i) => (sc.videoUrl || sc.imageUrl ? i : -1)).filter(i => i >= 0)
-          : prev.map((_, i) => i);
-        extra = Math.max(0, data.length - idxs.length);
-        missing = Math.max(0, idxs.length - data.length);
-        let nextOrder = updated.reduce((m, sc) => Math.max(m, sc.order), 0);
-        data.forEach((v, i) => {
-          const voice = { voiceFile: v.file, voiceUrl: v.url, voiceName: v.file.name, voiceDuration: v.duration };
-          if (i < idxs.length) updated[idxs[i]] = { ...updated[idxs[i]], ...voice };
-          else {
-            nextOrder += 1;
-            updated.push({
-              id: `scene_${Date.now()}_${i}`,
-              order: nextOrder,
-              videoUrl: '',
-              videoName: isVN ? `Chưa có video/ảnh cảnh ${i + 1}` : `No video/image for scene ${i + 1}`,
-              videoDuration: v.duration,
-              videoWidth: 1920,
-              videoHeight: 1080,
-              ...voice,
-            });
-          }
-        });
-        return updated;
-      });
+      // Gán lần lượt cho các cảnh đã có hình/video (theo tỉ lệ: đúng số cảnh). Đoạn DƯ không tạo cảnh thừa mà để dành
+      // cho cảnh thêm sau (mục "giọng dự trữ").
+      const ids = scenesRef.current.filter(sc => sc.videoUrl || sc.imageUrl).map(sc => sc.id);
+      const used = Math.min(ids.length, data.length);
+      const reserve = data.slice(used);
+      setScenes(prev => prev.map(sc => {
+        const k = ids.indexOf(sc.id);
+        if (k < 0 || k >= used) return sc;
+        const v = data[k];
+        return { ...sc, voiceFile: v.file, voiceUrl: v.url, voiceName: v.file.name, voiceDuration: v.duration };
+      }));
+      if (reserve.length) setVoiceReserve(prev => [...prev, ...reserve]);
       const total = segs.reduce((t, sg) => t + sg.duration, 0);
+      const reserveSec = reserve.reduce((t, v) => t + v.duration, 0);
+      const missing = Math.max(0, ids.length - data.length);
       setVoiceSplitNote(isVN
-        ? `✅ Đã chia file ghi âm (${total.toFixed(1)}s) thành ${segs.length} đoạn${useScenes ? ' theo tỉ lệ từng cảnh (dùng HẾT giọng đọc)' : ` ~${voiceSplitSec}s`}, gán lần lượt cho các cảnh.${extra ? ` Còn ${extra} đoạn chưa có hình: hãy thêm ảnh/video cho các cảnh cuối.` : ''}${missing ? ` Có ${missing} cảnh cuối chưa có voice (file ghi âm hết trước).` : ''}`
-        : `✅ Voice (${total.toFixed(1)}s) split into ${segs.length} parts of ~${voiceSplitSec}s.`);
+        ? `✅ Đã chia giọng đọc (${total.toFixed(1)}s) thành ${segs.length} đoạn${useScenes ? ' theo tỉ lệ từng cảnh (dùng HẾT giọng đọc)' : ` ~${voiceSplitSec}s`}. ${used} đoạn đầu gán cho ${used} cảnh.${reserve.length ? ` Còn ${reserve.length} đoạn dư (${reserveSec.toFixed(1)}s) được GIỮ LẠI, tự gán cho cảnh bạn thêm sau.` : ''}${missing ? ` Có ${missing} cảnh cuối chưa có voice (giọng đọc hết trước).` : ''}`
+        : `✅ Voice (${total.toFixed(1)}s) split into ${segs.length} parts. ${used} assigned; ${reserve.length} kept for new scenes.`);
     } catch (e: any) {
       alert(isVN
         ? `Không chia được file ghi âm: ${e?.message || e}. Hãy thử đổi sang MP3 hoặc WAV.`
@@ -870,7 +912,8 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
     try {
       const result = await renderMovie(
         {
-          scenes: validScenes,
+          // Chỉ dùng phụ đề theo giọng nếu giọng đọc của cảnh không bị đổi sau khi nhận dạng
+          scenes: validScenes.map(sc => (sc.subtitleCues && sc.subtitleCuesFor === sc.voiceUrl && sc.subtitleCuesText === sc.subtitleText ? sc : { ...sc, subtitleCues: undefined })),
           settings: {
             aspectRatio, fitMode, quality,
             enableSubtitles, subtitleStyle,
@@ -1175,10 +1218,10 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                 <Music size={20} />
               </div>
               <span className="text-xs font-black uppercase text-amber-200 tracking-tight truncate max-w-full px-2">
-                {bgmUrl ? `🎵 ${bgmName}` : (isVN ? '+ Thêm Nhạc Nền BGM' : '+ Add Background Music')}
+                {isVN ? 'Thêm Nhạc nền' : 'Add Background Music'}
               </span>
               <span className="text-[10px] text-slate-400 font-medium mt-0.5">
-                {bgmUrl ? `${Math.round(bgmDuration)}s • ${isVN ? 'Đã tải' : 'Loaded'}` : (isVN ? 'Tự giảm âm khi có voice' : 'Audio ducking enabled')}
+                {bgmUrl ? `✓ ${bgmName} • ${Math.round(bgmDuration)}s` : (isVN ? 'Tự giảm nhẹ khi có voice' : 'Gently lowers under voice')}
               </span>
               <input 
                 type="file" 
@@ -1347,6 +1390,11 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                 <input type="checkbox" checked={voiceSplitSnap} onChange={(e) => setVoiceSplitSnap(e.target.checked)} className="accent-emerald-500" />
                 {isVN ? 'cắt ở chỗ ngắt nghỉ (bỏ chọn = cắt đúng từng N giây)' : 'cut at pauses (off = exact N seconds)'}
               </label>
+              {voiceReserve.length > 0 && (
+                <button type="button" onClick={() => setVoiceReserve([])} className="px-2 py-0.5 rounded-md bg-slate-700 text-slate-200 text-[10px]">
+                  {isVN ? `Bỏ ${voiceReserve.length} đoạn giọng dư` : `Discard ${voiceReserve.length} spare part(s)`}
+                </button>
+              )}
               {voiceSplitNote && <div className="basis-full text-[10px] text-emerald-300 whitespace-pre-line">{voiceSplitNote}</div>}
             </div>
 
@@ -1473,12 +1521,15 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                             <select
                               value={scene.motionStyle ?? 'auto'}
                               onChange={(e) => updateImageScene(scene.id, { motionStyle: e.target.value as MotionStyle })}
+                              title={isVN
+                                ? 'Hiệu ứng ảnh (rê chuột lên từng mục để xem mô tả)\n\n• Tự động: tool tự nhận diện. Slide/infographic có nền phẳng -> chữ và thẻ hiện lần lượt; ảnh chụp -> zoom nhẹ.\n• An toàn chữ: chỉ chuyển động nhẹ nền, chữ giữ nguyên, không bị méo.\n• Zoom nhẹ: phóng to/thu nhỏ chậm cả bức ảnh (hợp ảnh chụp, ảnh có người).\n• Đứng yên: không chuyển động.'
+                                : 'Image effect'}
                               className="bg-slate-900 border border-slate-700 rounded-md px-1.5 py-0.5 text-[10px] text-slate-100 outline-none focus:border-amber-400"
                             >
-                              <option value="auto">{isVN ? 'Tự động' : 'Auto'}</option>
-                              <option value="text-safe">{isVN ? 'An toàn chữ' : 'Text-safe'}</option>
-                              <option value="kenburns">{isVN ? 'Zoom nhẹ' : 'Gentle zoom'}</option>
-                              <option value="none">{isVN ? 'Đứng yên' : 'Static'}</option>
+                              <option value="auto" title={isVN ? 'Tool tự nhận diện: slide/infographic nền phẳng thì chữ và thẻ hiện lần lượt; ảnh chụp thì zoom nhẹ.' : 'Auto-detect'}>{isVN ? 'Tự động' : 'Auto'}</option>
+                              <option value="text-safe" title={isVN ? 'Chỉ chuyển động nhẹ phần nền, chữ giữ nguyên, không bị méo.' : 'Subtle motion, text untouched'}>{isVN ? 'An toàn chữ' : 'Text-safe'}</option>
+                              <option value="kenburns" title={isVN ? 'Phóng to/thu nhỏ chậm cả bức ảnh. Hợp ảnh chụp; với slide nhiều chữ nên dùng Tự động.' : 'Slow zoom of the whole image'}>{isVN ? 'Zoom nhẹ' : 'Gentle zoom'}</option>
+                              <option value="none" title={isVN ? 'Ảnh đứng yên suốt cảnh.' : 'Static image'}>{isVN ? 'Đứng yên' : 'Static'}</option>
                             </select>
                             <span className="text-slate-400">
                               {scene.motionInfo === null || scene.motionInfo === undefined
@@ -1503,8 +1554,9 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                           return (
                             <div className="flex flex-wrap items-center gap-2 mt-1.5 text-[10px] text-slate-300">
                               <label className="flex items-center gap-1">
-                                <span>{isVN ? 'Thời lượng cảnh' : 'Scene length'}</span>
-                                <input
+                                <span>{isVN ? 'Thời lượng' : 'Length'}</span>
+                                {scene.userDuration === undefined && <span className="text-emerald-400 font-bold">{info.seconds.toFixed(1)}s</span>}
+                                {scene.userDuration !== undefined && <input
                                   type="number" min={0.5} max={600} step={0.5}
                                   value={scene.userDuration ?? ''}
                                   placeholder={info.seconds.toFixed(1)}
@@ -1514,15 +1566,20 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                                     updateImageScene(scene.id, { userDuration: v });
                                   }}
                                   className="w-16 bg-slate-900 border border-slate-700 rounded-md px-1 py-0.5 text-[10px] text-slate-100 outline-none focus:border-amber-400"
-                                />
-                                <span>{isVN ? 'giây' : 'sec'}</span>
+                                />}
+                                {scene.userDuration !== undefined && <span>{isVN ? 'giây' : 'sec'}</span>}
                               </label>
-                              <span className={info.source === 'user' ? 'text-amber-300' : 'text-emerald-400'}>{sourceText}</span>
-                              {scene.userDuration !== undefined && (
-                                <button type="button" onClick={() => updateImageScene(scene.id, { userDuration: undefined })} className="text-slate-400 underline">
-                                  {isVN ? 'về tự động' : 'auto'}
-                                </button>
-                              )}
+                              <select
+                                value={scene.userDuration === undefined ? 'auto' : 'custom'}
+                                onChange={(e) => updateImageScene(scene.id, { userDuration: e.target.value === 'auto' ? undefined : (scene.userDuration ?? Math.round(info.seconds * 2) / 2) })}
+                                title={isVN
+                                  ? 'Tự động: cảnh dài đúng bằng giọng đọc (nếu có), không thì theo mặc định của ảnh hoặc độ dài clip.\nĐặt số giây: bạn quyết định, ưu tiên cao nhất (giọng đọc dài hơn sẽ bị cắt, clip ngắn hơn sẽ lặp lại).'
+                                  : 'Auto: follows the voice (if any), else the image default or clip length. Set seconds: you decide; highest priority.'}
+                                className="bg-slate-900 border border-slate-700 rounded-md px-1.5 py-0.5 text-[10px] text-slate-100 outline-none focus:border-amber-400"
+                              >
+                                <option value="auto">{isVN ? `Tự động (${sourceText})` : `Auto (${sourceText})`}</option>
+                                <option value="custom">{isVN ? 'Đặt số giây' : 'Set seconds'}</option>
+                              </select>
                               {cut > 0 && <span className="text-red-400">{isVN ? `⚠ giọng đọc bị cắt ${cut.toFixed(1)}s` : `⚠ voice cut by ${cut.toFixed(1)}s`}</span>}
                               {loops && <span className="text-amber-300">{isVN ? 'clip ngắn hơn: sẽ lặp lại cho đủ' : 'clip shorter: will loop'}</span>}
                             </div>
@@ -1699,6 +1756,22 @@ Cảnh ${sceneCount}: [Câu lời thoại cảnh ${sceneCount}]`;
                   </select>
                 )}
               </div>
+            </div>
+
+            {/* Phụ đề theo giọng đọc (AI nghe giọng đọc) */}
+            <div className="pt-2 border-t border-slate-850">
+              <button
+                type="button"
+                disabled={isTranscribing}
+                onClick={handleTranscribeVoices}
+                title={isVN
+                  ? 'AI nghe giọng đọc của từng cảnh, chép lại đúng lời nói và chia dòng theo dấu câu; chữ hiện đúng lúc người đọc tới đó. Dùng khóa API như các tính năng AI khác, mỗi cảnh 1 lượt gọi. Sẽ thay thế chữ phụ đề hiện có của các cảnh có giọng đọc.'
+                  : 'AI listens to each scene voice and creates timed subtitles.'}
+                className="w-full text-[10px] font-black uppercase tracking-wide px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white"
+              >
+                {isTranscribing ? (isVN ? 'Đang tạo phụ đề...' : 'Working...') : (isVN ? 'Tạo phụ đề từ giọng đọc (AI)' : 'Subtitles from voice (AI)')}
+              </button>
+              {transcribeStatus && <div className="mt-1 text-[10px] text-emerald-300">{transcribeStatus}</div>}
             </div>
 
             {/* 6. Background Music Options */}
