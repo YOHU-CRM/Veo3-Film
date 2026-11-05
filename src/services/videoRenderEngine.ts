@@ -101,9 +101,17 @@ export interface RenderOptions {
     keepOriginalAudio?: boolean;
     /** [MỚI] Âm lượng tiếng gốc 0..1 (mặc định 1 = nguyên bản) */
     originalVolume?: number;
-    /** [MỚI] Ghép 2 video song song: clip chính ở trên/giữa/dưới, phần trống chạy video thứ 2 (cần options.secondaryVideo) */
+    /** [MỚI] Ghép 2 video cùng hiển thị (cần options.secondaryVideo) */
     splitScreen?: boolean;
+    /**
+     * [SỬA] Vị trí clip chính khi lệch tỉ lệ khung (dùng cả khi có / không có video thứ 2):
+     * 'top' = đầu (trái nếu khung có chỗ trống hai bên, trên nếu trống trên/dưới),
+     * 'middle' = giữa (mặc định), 'bottom' = cuối (phải / dưới).
+     * Có video thứ 2: video thứ 2 luôn nằm ở phía còn lại.
+     */
     splitMainPos?: 'top' | 'middle' | 'bottom';
+    /** [MỚI] Khi ghép 2 video: 'main' / 'second' = phóng to video đó tràn viền, lấp chỗ trống; 'none' = giữ đủ hình */
+    splitFill?: 'none' | 'main' | 'second';
   };
   /** [MỚI] Video thứ 2 chạy song song (lặp lại, tắt tiếng) */
   secondaryVideo?: { url: string; name?: string };
@@ -210,6 +218,24 @@ const FRAME_MS = 1000 / 30;
 const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
 const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+interface Rect { x: number; y: number; w: number; h: number }
+
+/** [MỚI] Vừa khít trong khung r, giữ đủ hình (có thể thừa viền) */
+function containRect(r: Rect, vw: number, vh: number): Rect {
+  const k = Math.min(r.w / vw, r.h / vh);
+  const w = vw * k;
+  const h = vh * k;
+  return { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h };
+}
+
+/** [MỚI] Phóng tràn khung r (cắt phần thừa), không để chỗ trống */
+function coverRect(r: Rect, vw: number, vh: number): Rect {
+  const k = Math.max(r.w / vw, r.h / vh);
+  const w = vw * k;
+  const h = vh * k;
+  return { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h };
+}
 
 function roundedRectPath(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   const rr = Math.min(r, w / 2, h / 2);
@@ -641,7 +667,8 @@ export async function renderMovie(
   const keepOrigAudio = !!settings.keepOriginalAudio;
   const origVol = typeof settings.originalVolume === 'number' && isFinite(settings.originalVolume) ? Math.min(1, Math.max(0, settings.originalVolume)) : 1;
   const splitOn = !!settings.splitScreen && !!options.secondaryVideo?.url;
-  const splitPos = settings.splitMainPos ?? 'top';
+  const splitPos = settings.splitMainPos ?? 'middle';
+  const splitFill = settings.splitFill ?? 'none';
   // [MỚI] phụ đề ở sát đáy (kiểu cũ) thì mới chừa chỗ dưới khung hình
   const subsAtBottom = settings.subtitleY === undefined || settings.subtitleY >= 80;
   const { signal, onProgress } = callbacks || {};
@@ -819,7 +846,7 @@ export async function renderMovie(
     if (e.data && e.data.size > 0) recordedChunks.push(e.data);
   };
 
-  // [MỚI] Video thứ 2 chạy song song (bố cục 2 video): lặp lại, tắt tiếng, vẽ làm nền phía sau clip chính
+  // [MỚI] Video thứ 2 chạy song song (bố cục 2 video): lặp lại, tắt tiếng
   let secEl: HTMLVideoElement | null = null;
   if (splitOn && options.secondaryVideo?.url) {
     const sv = document.createElement('video');
@@ -905,33 +932,89 @@ export async function renderMovie(
   })();
   const prev = makeCanvas(targetW, targetH);
   const blurSmall = makeCanvas(Math.max(48, Math.round(targetW / 24)), Math.max(48, Math.round(targetH / 24)));
+  // [MỚI] nền mờ dựng từ video thứ 2 (lấp phần thừa khi ghép 2 video)
+  const secBlur = makeCanvas(Math.max(48, Math.round(targetW / 24)), Math.max(48, Math.round(targetH / 24)));
 
   const hasAnySubs = (sc: LoadedScene) =>
     settings.enableSubtitles && (!!globalCues || (!!sc.cues && sc.cues.length > 0));
 
   /** [MỚI] Bố cục 2 video: chỉ áp dụng cho clip video khi video thứ 2 đã sẵn sàng */
   const splitActive = (sc: LoadedScene) => splitOn && secReady() && !sc.isImg && !sc.textSlide;
-  /** [MỚI] Clip chính vừa khít khung (giữ đủ hình), đặt ở trên / giữa / dưới; phần trống để video thứ 2 hiện ra */
-  const splitRect = (sc: LoadedScene) => {
-    const fit = Math.min(targetW / sc.vW, targetH / sc.vH);
-    const fw = sc.vW * fit;
-    const fh = sc.vH * fit;
-    const fx = (targetW - fw) / 2;
-    const fy = splitPos === 'top' ? 0 : splitPos === 'bottom' ? targetH - fh : (targetH - fh) / 2;
-    return { fx, fy, fw, fh, radius: 0 };
-  };
-  /** [MỚI] Vẽ video thứ 2 tràn khung (cắt giữa) làm nền */
-  const drawSecondary = (c: CanvasRenderingContext2D) => {
+
+  /**
+   * [MỚI] Chia khung thành 2 ô: clip chính + video thứ 2.
+   *  - Khung có chỗ trống hai bên (clip dọc vào khung ngang) → xếp NGANG (trái | phải).
+   *  - Khung có chỗ trống trên/dưới (clip ngang vào khung dọc) → xếp DỌC (trên / dưới).
+   *  - Vị trí 'top' = clip chính ở đầu (trái / trên), video 2 ở phía còn lại; 'bottom' = ngược lại;
+   *    'middle' = hai video nằm cạnh nhau, căn giữa khung.
+   *  - splitFill 'main' / 'second': video đó phóng tràn, ăn hết chỗ trống thừa.
+   * Không còn chỗ trống (clip đã vừa khung) → trả null: video 2 làm nền, clip chính phủ lên trên.
+   */
+  const splitLayout = (sc: LoadedScene): { main: Rect; sec: Rect; mainCover: boolean; secCover: boolean } | null => {
     const sv = secEl;
-    if (!sv || !secReady()) return;
-    const k = Math.max(targetW / sv.videoWidth, targetH / sv.videoHeight);
-    const w = sv.videoWidth * k;
-    const h = sv.videoHeight * k;
-    c.drawImage(sv, (targetW - w) / 2, (targetH - h) / 2, w, h);
+    if (!sv) return null;
+    const W = targetW;
+    const H = targetH;
+    const am = sc.vW / sc.vH;
+    const as = sv.videoWidth / sv.videoHeight;
+    const row = am <= W / H; // true: xếp ngang (trái|phải)
+    const L = row ? W : H; // chiều dài theo trục xếp
+    const C = row ? H : W; // chiều còn lại
+    const cellOf = (a0: number, a1: number): Rect => (row ? { x: a0, y: 0, w: a1 - a0, h: C } : { x: 0, y: a0, w: C, h: a1 - a0 });
+    // [MỚI] Khung 1:1: 2 video ghép sát nhau ở giữa, mỗi video một nửa, phủ kín khung (không còn nền viền)
+    // clip dọc → trái | phải ; clip ngang → trên / dưới. 'bottom' = clip chính ở nửa sau, còn lại clip chính ở nửa đầu.
+    if (Math.abs(W - H) < 2) {
+      const half = L / 2;
+      const mainFirst = splitPos !== 'bottom';
+      return {
+        main: mainFirst ? cellOf(0, half) : cellOf(half, L),
+        sec: mainFirst ? cellOf(half, L) : cellOf(0, half),
+        mainCover: true,
+        secCover: true,
+      };
+    }
+    const rA = row ? am : 1 / am;
+    const rS = row ? as : 1 / as;
+    const mainAlong = Math.min(L, C * rA);
+    const avail = L - mainAlong;
+    if (avail < L * 0.03) return null;
+    const secAlong = Math.min(C * rS, avail);
+    const slack = avail - secAlong;
+    const fillMain = splitFill === 'main';
+    const fillSec = splitFill === 'second';
+    let m0: number, m1: number, s0: number, s1: number;
+    if (splitPos === 'top') {
+      m0 = 0;
+      m1 = mainAlong + (fillMain ? slack : 0);
+      s0 = m1;
+      s1 = L;
+    } else if (splitPos === 'bottom') {
+      m1 = L;
+      m0 = L - mainAlong - (fillMain ? slack : 0);
+      s0 = 0;
+      s1 = m0;
+    } else if (fillMain) {
+      m0 = 0;
+      m1 = mainAlong + slack;
+      s0 = m1;
+      s1 = L;
+    } else if (fillSec) {
+      m0 = 0;
+      m1 = mainAlong;
+      s0 = m1;
+      s1 = L;
+    } else {
+      const g = slack / 2;
+      m0 = g;
+      m1 = g + mainAlong;
+      s0 = m1;
+      s1 = m1 + secAlong;
+    }
+    const cell = (a0: number, a1: number): Rect => (row ? { x: a0, y: 0, w: a1 - a0, h: C } : { x: 0, y: a0, w: C, h: a1 - a0 });
+    return { main: cell(m0, m1), sec: cell(s0, s1), mainCover: fillMain, secCover: fillSec };
   };
 
   const frameRect = (sc: LoadedScene, t: number) => {
-    if (splitActive(sc)) return splitRect(sc);
     const subReserve = hasAnySubs(sc) && subsAtBottom ? targetH * 0.15 : 0; // [SỬA] theo vị trí phụ đề
     // ảnh/slide có chữ: khung lớn hơn và gần như không phóng to để chữ không bị nhoè do co giãn liên tục
     const margin = sc.isImg ? 0.975 : 0.93;
@@ -948,6 +1031,12 @@ export async function renderMovie(
     if (useFill) {
       if (fw > targetW) fx = (targetW - fw) * focus;
       if (fh > targetH) fy = (targetH - fh) * focus;
+    } else if (!sc.isImg && splitPos !== 'middle') {
+      // [MỚI] vị trí clip khi lệch tỉ lệ: trái/phải (clip dọc vào khung ngang) hoặc trên/dưới (clip ngang vào khung dọc)
+      const m = Math.min(targetW, targetH) * 0.02;
+      const rawFit = Math.min(targetW / sc.vW, (targetH - subReserve) / sc.vH);
+      if (targetW - sc.vW * rawFit > targetW * 0.04) fx = splitPos === 'top' ? m : targetW - fw - m;
+      else if (targetH - subReserve - sc.vH * rawFit > targetH * 0.04) fy = splitPos === 'top' ? m : targetH - subReserve - fh - m;
     }
     return {
       fx,
@@ -1239,6 +1328,42 @@ export async function renderMovie(
     return view;
   };
 
+  /** [MỚI] Vẽ cảnh ghép 2 video: nền mờ (từ video 2) → video 2 → clip chính (có hiệu ứng) */
+  const drawSplitScene = (c: CanvasRenderingContext2D, sc: LoadedScene, el: number) => {
+    const sv = secEl;
+    if (!sv) return;
+    const full: Rect = { x: 0, y: 0, w: targetW, h: targetH };
+    const lay = splitLayout(sc) ?? { main: full, sec: full, mainCover: false, secCover: true };
+
+    // nền mờ lấp phần thừa
+    secBlur.ctx.drawImage(sv, 0, 0, secBlur.canvas.width, secBlur.canvas.height);
+    c.save();
+    c.imageSmoothingEnabled = true;
+    c.drawImage(secBlur.canvas, 0, 0, targetW, targetH);
+    c.fillStyle = 'rgba(0,0,0,0.5)';
+    c.fillRect(0, 0, targetW, targetH);
+    c.restore();
+
+    // video thứ 2
+    const sr = lay.secCover ? coverRect(lay.sec, sv.videoWidth, sv.videoHeight) : containRect(lay.sec, sv.videoWidth, sv.videoHeight);
+    c.save();
+    c.beginPath();
+    c.rect(lay.sec.x, lay.sec.y, lay.sec.w, lay.sec.h);
+    c.clip();
+    c.drawImage(sv, sr.x, sr.y, sr.w, sr.h);
+    c.restore();
+
+    // clip chính
+    const mr = lay.mainCover ? coverRect(lay.main, sc.vW, sc.vH) : containRect(lay.main, sc.vW, sc.vH);
+    c.save();
+    c.beginPath();
+    c.rect(lay.main.x, lay.main.y, lay.main.w, lay.main.h);
+    c.clip();
+    const view = drawMediaFx(c, sc, el, mr.x, mr.y, mr.w, mr.h, false);
+    drawOverlays(c, sc.plan, view, mr.x, mr.y, mr.w, mr.h, el, targetH, subBand);
+    c.restore();
+  };
+
   // ── Vẽ 1 khung hình của cảnh ──
   const drawSceneFrame = (sc: LoadedScene, sIdx: number, elapsedMs: number, isLast: boolean, sceneMs: number) => {
     const c = mainCtx;
@@ -1276,11 +1401,8 @@ export async function renderMovie(
       c.fillRect(0, 0, targetW, targetH);
       if (sc.textSlide) {
         drawTextScene(c, sc, elapsedSec);
-      } else if (splitActive(sc)) { // [MỚI] bố cục 2 video: video 2 làm nền, clip chính ở trên/giữa/dưới
-        drawSecondary(c);
-        const sr = splitRect(sc);
-        const view = drawMediaFx(c, sc, elapsedSec, sr.fx, sr.fy, sr.fw, sr.fh, false);
-        drawOverlays(c, sc.plan, view, sr.fx, sr.fy, sr.fw, sr.fh, elapsedSec, targetH, subBand);
+      } else if (splitActive(sc)) { // [SỬA] ghép 2 video: chia ô theo vị trí đã chọn
+        drawSplitScene(c, sc, elapsedSec);
       } else if (settings.fitMode === 'cover' || fullBleed(sc)) { // [SỬA] MXH: tràn màn hình
         const scale = Math.max(targetW / sc.vW, targetH / sc.vH);
         const dx = (targetW - sc.vW * scale) / 2, dy = (targetH - sc.vH * scale) / 2, dw = sc.vW * scale, dh = sc.vH * scale;
@@ -1298,8 +1420,13 @@ export async function renderMovie(
         const useFillC = fillAmt > 0 && !sc.isImg; // [MỚI] mặc định 0 = như cũ
         const r = useFillC ? rContain + (Math.max(targetW / sc.vW, targetH / sc.vH) - rContain) * fillAmt : rContain;
         const dw = sc.vW * r, dh = sc.vH * r;
-        const dx = useFillC && dw > targetW ? (targetW - dw) * focus : (targetW - dw) / 2;
-        const dy = useFillC && dh > targetH ? (targetH - dh) * focus : (targetH - dh) / 2;
+        let dx = useFillC && dw > targetW ? (targetW - dw) * focus : (targetW - dw) / 2;
+        let dy = useFillC && dh > targetH ? (targetH - dh) * focus : (targetH - dh) / 2;
+        if (!useFillC && !sc.isImg && splitPos !== 'middle') { // [MỚI] vị trí clip: trái/phải hoặc trên/dưới
+          const m = Math.min(targetW, targetH) * 0.02;
+          if (targetW - dw > targetW * 0.04) dx = splitPos === 'top' ? m : targetW - dw - m;
+          else if (targetH - dh > targetH * 0.04) dy = splitPos === 'top' ? m : targetH - dh - m;
+        }
         const view = drawMediaFx(c, sc, elapsedSec, dx, dy, dw, dh, false); // [SỬA] hiệu ứng
         drawOverlays(c, sc.plan, view, dx, dy, dw, dh, elapsedSec, targetH, subBand);
       }
@@ -1329,11 +1456,11 @@ export async function renderMovie(
 
     if (sc.textSlide) {
       drawTextScene(c, sc, elapsedSec);
+    } else if (splitActive(sc)) {
+      drawSplitScene(c, sc, elapsedSec); // [SỬA] ghép 2 video: chia ô theo vị trí đã chọn
     } else {
     // 1) Nền
-    if (splitActive(sc)) {
-      drawSecondary(c); // [MỚI] bố cục 2 video: video thứ 2 làm nền
-    } else if (settings.fitMode === 'blur') {
+    if (settings.fitMode === 'blur') {
       if (sc.blurBg) {
         c.drawImage(sc.blurBg, 0, 0, targetW, targetH);
       } else {
@@ -1351,7 +1478,7 @@ export async function renderMovie(
     }
 
     // 2) Hình chính
-    if ((settings.fitMode === 'cover' || fullBleed(sc)) && !splitActive(sc)) { // [SỬA] MXH: ảnh đúng tỉ lệ tràn màn hình
+    if (settings.fitMode === 'cover' || fullBleed(sc)) { // [SỬA] MXH: ảnh đúng tỉ lệ tràn màn hình
       const kb = 1 + (fullBleed(sc) ? 0.015 : sc.isImg ? 0.07 : 0.045) * t; // ảnh thiết kế sẵn: chỉ trôi rất nhẹ, không cắt chữ
       const scale = Math.max(targetW / sc.vW, targetH / sc.vH) * kb;
       const dx = (targetW - sc.vW * scale) / 2, dy = (targetH - sc.vH * scale) / 2, dw = sc.vW * scale, dh = sc.vH * scale;
