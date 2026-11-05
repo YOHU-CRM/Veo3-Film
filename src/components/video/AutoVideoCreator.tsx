@@ -210,7 +210,10 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   const [keepOrigAudio, setKeepOrigAudio] = usePersistentState<boolean>('yohu_av_keepOrig', true);
   const [origVolume, setOrigVolume] = usePersistentState<number>('yohu_av_origVol', 100);
   const [splitScreen, setSplitScreen] = usePersistentState<boolean>('yohu_av_split', false);
-  const [splitPos, setSplitPos] = usePersistentState<'top' | 'middle' | 'bottom'>('yohu_av_splitPos', 'top');
+  // [SỬA] Vị trí clip chính (đầu = trái/trên · giữa · cuối = phải/dưới) — dùng cả khi có / không có video thứ 2
+  const [splitPos, setSplitPos] = usePersistentState<'top' | 'middle' | 'bottom'>('yohu_av_place', 'middle');
+  // [MỚI] Khi ghép 2 video: phóng tràn viền 1 trong 2 video để lấp chỗ trống
+  const [splitFill, setSplitFill] = usePersistentState<'none' | 'main' | 'second'>('yohu_av_splitFill', 'none');
   const [secondaryVideo, setSecondaryVideo] = useState<{ url: string; name: string } | null>(null);
   const handleSecondaryPick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -820,7 +823,7 @@ export const AutoVideoCreator: React.FC<AutoVideoCreatorProps> = ({
   /**
    * [SỬA] Tạo phụ đề từ voice — MIỄN PHÍ khi đã có lời thoại:
    *  - Voice dài: lời thoại của voice (tự nhận từ công cụ Giọng đọc / người dùng dán) → tách câu,
-   *    đặt chỗ ngắt đúng chỗ giọng nghỉ → chia câu vào từng cảnh ("Cảnh 1: …" nếu có, không thì theo thứ tự)
+   *    đặt chỗ ngắt đúng chỗ giọng nghỉ → chia câu vào từng cảnh ("Cảnh 1:" nếu có, không thì theo thứ tự)
    *  - Voice từng cảnh: chữ trong ô lời thoại → căn theo chỗ giọng nghỉ
    *  - AI (Gemini) chỉ chạy khi người dùng bấm "AI nghe giọng" cho voice không có lời
    */
@@ -1440,8 +1443,9 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
             focusX: focusX / 100,           // [MỚI] vị trí giữ lại khi cắt
             keepOriginalAudio: keepOrigAudio,          // [MỚI] giữ tiếng gốc của clip
             originalVolume: origVolume / 100,          // [MỚI] 100% = nguyên bản
-            splitScreen: splitScreen && !!secondaryVideo, // [MỚI] ghép 2 video song song
-            splitMainPos: splitPos,                    // [MỚI] clip chính: trên / giữa / dưới
+            splitScreen: splitScreen && !!secondaryVideo, // [MỚI] ghép 2 video cùng hiển thị
+            splitMainPos: splitPos,                    // [SỬA] vị trí clip chính: đầu / giữa / cuối
+            splitFill,                                 // [MỚI] phóng tràn 1 trong 2 video
             enableSubtitles, subtitleStyle,
             enableBgm: enableBgm && !!bgmUrl,
             bgmVolume,
@@ -1522,6 +1526,19 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
     setProgressPercent(0);
     setStatusMessage('');
   };
+
+  // [MỚI] Nhãn vị trí clip theo hướng chuyển khổ: clip dọc → khung ngang = trái/giữa/phải; clip ngang → khung dọc = trên/giữa/dưới
+  const refClipScene = scenes.find(s => s.videoUrl && !s.isImage) || scenes.find(s => s.videoUrl);
+  const refClipAr = refClipScene && refClipScene.videoHeight ? refClipScene.videoWidth / refClipScene.videoHeight : 16 / 9;
+  const refOutAr = aspectRatio === '16:9' ? 16 / 9
+    : aspectRatio === '9:16' ? 9 / 16
+    : aspectRatio === '1:1' ? 1
+    : (scenes[0] && scenes[0].videoHeight ? scenes[0].videoWidth / scenes[0].videoHeight : 16 / 9);
+  const placeSides = refClipAr < refOutAr - 0.02; // true = chỗ trống hai bên (trái/phải)
+  const placeLabels: [string, string, string] = placeSides
+    ? [isVN ? 'Trái' : 'Left', isVN ? 'Giữa' : 'Center', isVN ? 'Phải' : 'Right']
+    : [isVN ? 'Trên' : 'Top', isVN ? 'Giữa' : 'Middle', isVN ? 'Dưới' : 'Bottom'];
+  const isSquareOut = aspectRatio === '1:1';
 
   return (
     <div className="flex-1 bg-slate-950 flex flex-col min-h-0 overflow-y-auto custom-scrollbar font-sans text-slate-100 p-3 sm:p-5">
@@ -2383,7 +2400,7 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
               </span>
             </button>
 
-            {/* [MỚI] Tiếng gốc & ghép 2 video (thu gọn, mặc định đóng để giao diện gọn) */}
+            {/* [MỚI] Vị trí clip · Tiếng gốc · Ghép 2 video (thu gọn, mặc định đóng để giao diện gọn) */}
             <div className="bg-slate-950 border border-slate-800 rounded-xl">
               <button
                 type="button"
@@ -2391,7 +2408,7 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
                 className="w-full flex justify-between items-center px-3 py-2 text-[10px] font-black uppercase text-slate-300 hover:text-white"
               >
                 <span>
-                  {isVN ? 'Tiếng gốc & Ghép 2 video' : 'Original audio & Dual video'}
+                  {isVN ? 'Vị trí clip · Tiếng gốc · Ghép 2 video' : 'Clip position · Audio · Dual video'}
                   <span className="ml-2 text-amber-400 normal-case">
                     {keepOrigAudio ? (isVN ? `Tiếng gốc ${origVolume}%` : `Audio ${origVolume}%`) : (isVN ? 'Tiếng gốc: tắt' : 'Audio: off')}
                     {splitScreen && secondaryVideo ? (isVN ? ' • 2 video' : ' • 2 videos') : ''}
@@ -2430,6 +2447,32 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
                     )}
                   </div>
 
+                  {/* [MỚI] Vị trí clip chính — dọc→ngang: Trái/Giữa/Phải · ngang→dọc: Trên/Giữa/Dưới */}
+                  <div>
+                    <span className="text-[10px] font-black uppercase text-slate-400 block mb-1">
+                      {isVN ? 'Vị trí clip khi lệch tỷ lệ khung' : 'Clip position when ratio differs'}
+                    </span>
+                    <div className="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+                      {(['top', 'middle', 'bottom'] as const).map((val, i) => (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => setSplitPos(val)}
+                          className={`py-1.5 rounded-md text-[10px] font-black uppercase transition ${
+                            splitPos === val ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {placeLabels[i]}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-snug mt-1">
+                      {isVN
+                        ? 'Clip dọc đưa vào khung ngang: Trái / Giữa / Phải. Clip ngang đưa vào khung dọc: Trên / Giữa / Dưới. Dùng với chế độ Nền mờ hoặc Viền đen.'
+                        : 'Portrait clip in a landscape frame: Left / Center / Right. Landscape clip in a portrait frame: Top / Middle / Bottom. Use with Blur BG or Letterbox.'}
+                    </p>
+                  </div>
+
                   <div>
                     <label className="flex items-center gap-2 text-[11px] font-bold text-slate-200 cursor-pointer">
                       <input
@@ -2438,33 +2481,10 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
                         onChange={(e) => setSplitScreen(e.target.checked)}
                         className="accent-indigo-500"
                       />
-                      {isVN ? 'Ghép 2 video song song' : 'Dual video (side by side)'}
+                      {isVN ? 'Ghép thêm video thứ 2 (cùng hiển thị)' : 'Add a 2nd video (shown together)'}
                     </label>
                     {splitScreen && (
                       <div className="mt-2 space-y-2">
-                        <div>
-                          <span className="text-[10px] font-black uppercase text-slate-400 block mb-1">
-                            {isVN ? 'Vị trí clip chính (khổ ngang)' : 'Main clip position'}
-                          </span>
-                          <div className="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
-                            {([
-                              ['top', isVN ? 'Trên' : 'Top'],
-                              ['middle', isVN ? 'Giữa' : 'Middle'],
-                              ['bottom', isVN ? 'Dưới' : 'Bottom'],
-                            ] as const).map(([val, label]) => (
-                              <button
-                                key={val}
-                                type="button"
-                                onClick={() => setSplitPos(val)}
-                                className={`py-1.5 rounded-md text-[10px] font-black uppercase transition ${
-                                  splitPos === val ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
-                                }`}
-                              >
-                                {label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
                         <div className="flex items-center gap-2">
                           <label className="cursor-pointer px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black uppercase transition">
                             {secondaryVideo ? (isVN ? 'Đổi video thứ 2' : 'Change video 2') : (isVN ? 'Chọn video thứ 2' : 'Choose video 2')}
@@ -2485,10 +2505,41 @@ Cảnh ${n}: [Câu lời thoại cảnh ${n}]`;
                             </>
                           )}
                         </div>
+
+                        {!isSquareOut && (
+                          <div>
+                            <span className="text-[10px] font-black uppercase text-slate-400 block mb-1">
+                              {isVN ? 'Phóng to tràn viền (lấp chỗ trống)' : 'Enlarge to fill the gap'}
+                            </span>
+                            <div className="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+                              {([
+                                ['none', isVN ? 'Không' : 'None'],
+                                ['main', isVN ? 'Clip chính' : 'Main clip'],
+                                ['second', isVN ? 'Video 2' : 'Video 2'],
+                              ] as const).map(([val, label]) => (
+                                <button
+                                  key={val}
+                                  type="button"
+                                  onClick={() => setSplitFill(val)}
+                                  className={`py-1.5 rounded-md text-[10px] font-black uppercase transition ${
+                                    splitFill === val ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                         <p className="text-[10px] text-slate-500 leading-snug">
-                          {isVN
-                            ? 'Dùng với khung xuất 9:16: clip chính giữ đủ hình ở vị trí đã chọn, phần trống chạy video thứ 2 (lặp lại, tắt tiếng). Chưa chọn video 2 thì dựng như bình thường.'
-                            : 'Use with 9:16 output: the main clip keeps its full frame at the chosen position, the rest plays video 2 (looped, muted). Without video 2 the movie renders normally.'}
+                          {isSquareOut
+                            ? (isVN
+                              ? 'Khung 1:1: hai video ghép sát nhau ở giữa, mỗi video một nửa khung, phủ kín, không còn nền viền (clip dọc: trái | phải, clip ngang: trên / dưới). Trái/Trên = clip chính ở nửa đầu, Phải/Dưới = clip chính ở nửa sau.'
+                              : '1:1 frame: both videos sit edge to edge in the middle, half the frame each, no borders.')
+                            : (isVN
+                              ? 'Clip chính đặt theo vị trí đã chọn ở trên, video thứ 2 chiếm phía còn lại (có thể khổ 1:1 hoặc bất kỳ). Chọn "Giữa" = 2 video nằm cạnh nhau ở giữa khung. Tích "Clip chính" hoặc "Video 2" để video đó phóng to tràn viền, lấp chỗ trống. Chưa chọn video 2 thì dựng bình thường.'
+                              : 'The main clip sits at the chosen position and video 2 takes the opposite side (any ratio, incl. 1:1). "Center" puts both side by side in the middle. Pick "Main clip" or "Video 2" to enlarge it to the edge. Without video 2 the movie renders normally.')}
                         </p>
                       </div>
                     )}
