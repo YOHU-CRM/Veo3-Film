@@ -1588,3 +1588,16 @@ export const transcribeAudioGemini = async (
   }
   throw lastError || new Error('Không nhận dạng được giọng nói.');
 };
+
+export const collectGeminiKeys = (...sources: any[]): string[] => {
+  const flat: string[] = [];
+  const walk = (v: any) => {
+    if (!v) return;
+    if (typeof v === 'string') flat.push(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (typeof v === 'object') { walk(v.apiKeys); walk(v.apiKey); }
+  };
+  sources.forEach(walk);
+  const own = processKeys(flat);
+  return own.length > 0 ? own : resolveKeys([], true);
+};
